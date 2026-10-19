@@ -15,7 +15,9 @@
        injected NSPPE; commands, tunnel log, logins, NUL-byte runs in logs, network indicators and Fox-IT iocitrix;
     6. writes <label>_Hunt_Results.xlsx per appliance and NetScaler_Findings_Summary.docx.
   The generic hunts (log poisoning, crash loops, hidden and new files, boot and cron hooks, shell history, log
-  truncation) run on every image, and the known implant paths and attacker IPs are always checked as well.
+  truncation) run on every image, and the known implant paths and attacker IPs are always checked as well: 189
+  built-in IPs, the 10 from the intrusion this tool was built on plus 179 C2, payload, exfiltration and exploit
+  sources from public reporting up to 2026-10-19.
   Nothing is written inside the evidence folder. Implant scripts and webshells are recorded by hash only and are
   never exported.
 
@@ -36,8 +38,8 @@
   Default: 30 days before the newest log on each image.
 .PARAMETER IocIp
   Extra attacker IPs (IPv4 or IPv6) to search every log for, such as IPs from the new client's own alerts. They
-  are added to the built-in list (the attacker IPs from the intrusion this tool was built on), which is always
-  searched. Give a list (-IocIp 203.0.113.10, 198.51.100.7) or read a text file with one IP per line
+  are added to the 189 built-in IPs (this tool's own case plus public reporting), which are always searched.
+  Give a list (-IocIp 203.0.113.10, 198.51.100.7) or read a text file with one IP per line
   (-IocIp (Get-Content .\client_ips.txt)); blank lines and text after # are ignored.
 .PARAMETER PythonExe
   Use this python.exe (3.10 to 3.13) as the base interpreter instead of searching for or installing one.
@@ -92,7 +94,7 @@
 
   Raw image, extra attacker IPs read from a text file (one per line), Fox-IT checks skipped for a quicker run.
 .NOTES
-  Version 1.1.0. Works in Windows PowerShell 5.1 and PowerShell 7. Engine SHA-256 (LF line endings):
+  Version 1.2.0. Works in Windows PowerShell 5.1 and PowerShell 7. Engine SHA-256 (LF line endings):
   __ENGINE_SHA256__
 #>
 [CmdletBinding()]
@@ -113,7 +115,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ToolVersion = '1.1.0'
+$ToolVersion = '1.2.0'
 $EngineSha256 = '__ENGINE_SHA256__'
 $PythonVersion = '3.13.16'
 $Packages = @('dissect==3.22', 'tabulate==0.10.0', 'XlsxWriter==3.2.9', 'python-docx==1.2.0')
@@ -278,7 +280,11 @@ try { Start-Transcript -Path (Join-Path $ToolDir 'powershell_transcript.txt') -A
 if ($item.PSIsContainer) { Write-Note "evidence : $Source (folder, read only)" }
 else { Write-Note "evidence : $Source (image file, read only)" }
 Write-Note "output   : $OutDir"
-if ($ExtraIps.Count) { Write-Note ("extra IPs: " + ($ExtraIps -join ', ') + ' (the built-in attacker IPs are searched too)') }
+if ($ExtraIps.Count) {
+  $shown = @($ExtraIps | Select-Object -First 10) -join ', '
+  if ($ExtraIps.Count -gt 10) { $shown += " and $($ExtraIps.Count - 10) more" }
+  Write-Note ("extra IPs: $($ExtraIps.Count) ($shown); the built-in attacker IPs are searched too")
+}
 try {
   $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($OutDir))
   $freeGb = [math]::Round($drive.AvailableFreeSpace / 1GB, 1)

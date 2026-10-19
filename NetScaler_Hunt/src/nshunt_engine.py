@@ -30,7 +30,7 @@ Examples (the output folder must not be inside the evidence folder):
 Options:
   --since YYYY-MM-DD    start of the review window (default: 30 days before the newest log of each image)
   --ioc-ip IP [IP ...]  extra attacker IPs (IPv4 or IPv6) to search every log for; they are added to the built-in
-                        list (BUILTIN_IOC_IPS below), which is always searched
+                        list (BUILTIN_IOC_IPS below: the tool's own case plus public reporting), which is always searched
   --foxit PATH          Fox-IT iocitrix.py to run with the compatibility fixes (omit to skip)
   --skip-log-xlsx       do not convert every log to .xlsx (the hunts still run)
   --include-base        also run the full hunt on the base (pre-snapshot) disk of each chain
@@ -59,36 +59,236 @@ import time
 import traceback
 from pathlib import Path
 
-ENGINE_VERSION = "1.1.0"
+ENGINE_VERSION = "1.2.0"
 UTC = dt.timezone.utc
 XL_MAX_ROWS = 1048575      # data rows per sheet (one header row on top)
 XL_MAX_CELL = 32000        # Excel allows 32,767 characters per cell
 
 # ------------------------------------------------------------------ known indicators (edit here)
-# Attacker IPs from the October 2026 intrusion this tool was built on (CVE-2026-88771 log poisoning, then a webshell,
-# tunnels and config theft). Every run searches all logs for them (hunt H); --ioc-ip adds more and never replaces them.
-# Level: confirmed = carried out attacker actions; likely = requested the webshell minutes before a config theft;
-# suspected = only probed this implant's webshell paths (could be a scanner that knows them). A hit is a lead to check.
-BUILTIN_IOC_IPS = [
+# Every run searches all logs for the attacker IPs below (hunt H); --ioc-ip adds more and never replaces them.
+# A hit is a lead to check, not proof: read the log line before calling it attacker activity.
+#
+# 1) The October 2026 intrusion this tool was built on (CVE-2026-88771 log poisoning, then a webshell, tunnels and
+#    config theft). Level: confirmed = carried out attacker actions; likely = requested the webshell minutes before a
+#    config theft; suspected = only probed this implant's webshell paths (could be a scanner that knows them).
+CASE_IOC_IPS = [
     ("213.209.159.55", "confirmed", "sent the poisoned logins, hosted the payload script that Call Home ran, used the "
-                                    "webshell (2026-10)"),
+                                    "webshell (2026-10; also reported by Beazley and Rapid7)"),
     ("124.198.132.44", "confirmed", "used the webshell as a tunnel into the internal network; SSH server of the reverse "
                                     "SSH tunnels (2026-10)"),
     ("162.33.177.119", "confirmed", "tried 118 times to download a config archive that an injected command was meant to "
                                     "create (2026-10)"),
     ("152.233.50.151", "likely", "requested the webshell minutes before a config theft (2026-10)"),
-    ("146.70.211.157", "suspected", "probed this implant's webshell paths (2026-10)"),
-    ("23.162.8.173", "suspected", "probed this implant's webshell paths (2026-10)"),
+    ("146.70.211.157", "suspected", "probed this implant's webshell paths (2026-10); Huntback.io decoys saw it send "
+                                    "CVE-2026-88771 injection checks"),
+    ("23.162.8.173", "suspected", "probed this implant's webshell paths (2026-10); Huntback.io decoys saw it send "
+                                  "CVE-2026-88771 injection checks"),
     ("37.19.221.148", "suspected", "probed this implant's webshell paths (2026-10)"),
     ("104.36.50.29", "suspected", "probed this implant's webshell paths (2026-10)"),
     ("23.234.94.126", "suspected", "probed this implant's webshell paths (2026-10)"),
     ("68.235.46.82", "suspected", "probed this implant's webshell paths (2026-10)"),
 ]
+# 2) Public reporting on NetScaler exploitation up to REPORTED_AS_OF: Rapid7, Zscaler, watchTowr, Unit 42, LevelBlue,
+#    eSentire, Mandiant, GreyNoise, Arctic Wolf, Sygnia, Truesec, Beazley, TENEX, SOCRadar, Lupovis, Corelight, IFIN, and
+#    the Poppelgaard checker (which relays Gotham Technology Group IR and Huntback.io decoy data). Only C2, payload,
+#    staging and exfiltration servers (reported-infra) and webshell users and exploit sources named by vendor or IR
+#    reports (reported-exploit) are included; mass-scan feeds, Tor exits and Cloudflare WARP addresses are left out.
+#    One line per IP: ip | level | what it was seen doing (sources).
+REPORTED_AS_OF = "2026-10-19"
+_REPORTED_IOC_IPS = """
+38.180.81.157 | reported-infra | Platypus C2 node sharing the cluster's TLS certificate (TENEX, Poppelgaard checker)
+45.141.21.130 | reported-infra | reverse-shell C2 (LevelBlue, eSentire, Arctic Wolf, TENEX, Poppelgaard checker)
+45.143.130.195 | reported-infra | C2 and payload server of the NetScaler C2 mass-exploitation framework (8899/tcp HTTP, 53/udp DNS) (SOCRadar, Poppelgaard checker)
+77.83.199.39 | reported-infra | potential C2 seen by Truesec (Unit 42, eSentire, Sygnia, Truesec, IFIN, Poppelgaard checker)
+89.44.80.7 | reported-infra | callback host (:65456 /exec-ok and id output; nc shell to :58963) (Arctic Wolf, Poppelgaard checker)
+95.133.231.109 | reported-infra | Platypus C2 node sharing the cluster's TLS certificate (TENEX, Poppelgaard checker)
+104.200.67.56 | reported-infra | Platypus C2 node sharing the cluster's TLS certificate (TENEX, Poppelgaard checker)
+104.248.244.66 | reported-infra | potential C2 seen by Truesec (Unit 42, Truesec, IFIN, Poppelgaard checker)
+130.94.20.222 | reported-infra | payload delivery (Rapid7 2026-10-19, watchTowr, TENEX, Poppelgaard checker)
+130.94.42.226 | reported-infra | callback host (:18805) (Arctic Wolf, Poppelgaard checker)
+139.180.152.138 | reported-infra | potential C2 seen by Truesec (Unit 42, eSentire, Truesec, IFIN, Poppelgaard checker)
+176.65.148.54 | reported-infra | Sliver C2 endpoint (:80) and ns_helper staging (:8080) (watchTowr, GreyNoise, Poppelgaard checker)
+192.159.99.139 | reported-infra | .slap C2, relay, reverse-agent and loot-upload infrastructure (Rapid7 2026-10-19)
+194.26.29.88 | reported-infra | Host of the reverse shell documented by Corelight (Corelight, Poppelgaard checker)
+195.123.233.245 | reported-infra | Primary Platypus C2 node (443); entretiensol.com and white-guard.pro resolve here (TENEX, Poppelgaard checker)
+199.233.217.13 | reported-infra | payload delivery (Rapid7 2026-10-19, TENEX, Poppelgaard checker)
+209.74.64.192 | reported-infra | C2 used by nsvmd (FreeBSD Go proxy in /flash/.nsvm/) (Rapid7 2026-10-19)
+45.92.1.17 | reported-infra | stage/loot infrastructure on port 30444 (Rapid7 2026-10-19)
+64.94.85.67 | reported-infra | payload delivery (Rapid7 2026-10-19, watchTowr, LevelBlue, eSentire, Arctic Wolf, Sygnia, TENEX, GreyNoise, Poppelgaard checker)
+81.94.239.8 | reported-infra | exfiltration server (port 8877) for a payload that stole ns.conf and the SSL keys (field report, 6 Oct) (Poppelgaard checker)
+138.199.200.90 | reported-infra | destination for data exfiltrated through log poisoning (Lupovis) (Lupovis, Poppelgaard checker)
+158.94.211.205 | reported-infra | exfiltration receiver (:8080) (Beazley, Poppelgaard checker)
+23.27.143.20 | reported-infra | exploit source and payload host (main.py) (LevelBlue, eSentire, Arctic Wolf, TENEX, Poppelgaard checker)
+31.56.197.72 | reported-infra | payload delivery (Rapid7 2026-10-19, LevelBlue, eSentire, Arctic Wolf, TENEX, Poppelgaard checker)
+46.151.182.18 | reported-infra | payload delivery (Rapid7 2026-10-19)
+46.151.182.131 | reported-infra | Bot-download host (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+62.133.62.80 | reported-infra | payload delivery (Rapid7 2026-10-19, LevelBlue, eSentire, Arctic Wolf, TENEX, Poppelgaard checker)
+68.178.160.183 | reported-infra | payload host (:8888 /test, :8899 /test111) (eSentire, Arctic Wolf, Poppelgaard checker)
+72.5.65.111 | reported-infra | tied to the 8 Oct v5v.in injection wave (payload host or wave source; reports differ) (Poppelgaard checker)
+77.247.126.239 | reported-infra | Backing host of the pinggy/serveo tunnel droppers (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+132.243.166.140 | reported-infra | payload delivery (Rapid7 2026-10-19)
+134.175.71.50 | reported-infra | payload host (:4123) (Arctic Wolf, Poppelgaard checker)
+143.198.7.94 | reported-infra | CVE-2026-88772 scanning and staging infrastructure (Mandiant, Beazley, Poppelgaard checker)
+153.75.82.220 | reported-infra | payload host (/download/x.sh) (eSentire, Arctic Wolf, GreyNoise, Poppelgaard checker)
+173.231.39.244 | reported-infra | payload delivery (Rapid7 2026-10-19, watchTowr, GreyNoise)
+177.4.12.11 | reported-infra | payload host (:8080 /s?t=a/b/c) (Arctic Wolf, Poppelgaard checker)
+179.60.146.241 | reported-infra | served 1.sh (Rapid7 2026-10-19)
+209.141.43.95 | reported-infra | payload host for kw2-freebsd-x64-s11 (Rust FreeBSD implant); also seen in StyleSmuggler activity (Zscaler 2026-10-16)
+45.59.125.187 | reported-exploit | PHP webshell source (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+66.135.19.18 | reported-exploit | requested the nsgclient18.deb / nsgser18.deb webshells (4-8 Sep) (Unit 42, Poppelgaard checker)
+104.28.215.136 | reported-exploit | Cloudflare WARP address requesting .deb webshells (9-11 Sep) (Unit 42)
+104.28.215.137 | reported-exploit | Cloudflare WARP address requesting .deb webshells (9-11 Sep) (Unit 42)
+104.28.247.136 | reported-exploit | Cloudflare WARP address requesting .deb webshells (9-11 Sep) (Unit 42)
+104.28.247.137 | reported-exploit | Cloudflare WARP address, continuous GetUserName requests (10-27 Sep) (Unit 42)
+104.248.74.206 | reported-exploit | requested the nsgclient18.deb / nsgser18.deb webshells (4-8 Sep) (Unit 42, Poppelgaard checker)
+137.184.91.207 | reported-exploit | requested the same .deb webshells (7 Sep) (Unit 42, Poppelgaard checker)
+142.93.85.227 | reported-exploit | requested the nsgclient18.deb / nsgser18.deb webshells (4-8 Sep) (Unit 42, Poppelgaard checker)
+162.33.178.9 | reported-exploit | requested the nsgbuild.deb / nsgsupport.deb webshells (14 Sep) (Unit 42, Poppelgaard checker)
+167.99.111.203 | reported-exploit | requested the nsgclient18.deb / nsgser18.deb webshells (4-8 Sep) (Unit 42, Poppelgaard checker)
+193.149.176.207 | reported-exploit | requested nsgbuild.deb daily (15-24 Sep) and GetUserName (Unit 42, Poppelgaard checker)
+5.83.144.60 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Poppelgaard checker)
+5.188.206.226 | reported-exploit | exploitation source (eSentire, Poppelgaard checker)
+23.234.74.48 | reported-exploit | CVE-2026-88771 exploitation source (watchTowr honeypots); Huntback.io decoys saw it prove exploitation out of band (watchTowr, GreyNoise, Poppelgaard checker)
+32.186.46.211 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+34.90.151.231 | reported-exploit | reconnaissance and webshell delivery (eSentire, Poppelgaard checker)
+37.19.221.171 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, GreyNoise)
+44.252.255.141 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, GreyNoise)
+45.12.239.191 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+45.61.144.161 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+45.76.34.141 | reported-exploit | high confidence: seen in malicious AAA events (Sygnia, Poppelgaard checker)
+45.143.167.96 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, GreyNoise)
+45.153.212.101 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+45.225.135.18 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+45.249.89.172 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, GreyNoise)
+46.33.33.95 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+46.233.40.20 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+46.236.167.143 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+47.230.224.154 | reported-exploit | source of NetScaler exploitation attempts (LevelBlue, Poppelgaard checker)
+49.150.197.119 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+51.158.203.95 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Beazley, Previdian, Poppelgaard checker)
+52.38.11.186 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+52.39.16.162 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+54.70.59.128 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, GreyNoise)
+64.227.181.23 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Poppelgaard checker)
+66.42.100.63 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Poppelgaard checker)
+70.172.58.168 | reported-exploit | source of NetScaler exploitation attempts (LevelBlue, Poppelgaard checker)
+78.47.24.217 | reported-exploit | fingerprinted 100+ systems (21-22 Aug); part of the 21 Sep webshell drop (Unit 42, Poppelgaard checker)
+78.128.113.10 | reported-exploit | exploitation-attempt source (GreyNoise, Marius Sandbu and Lupovis lists, 28-29 Sep) (Poppelgaard checker)
+78.128.114.22 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+78.135.96.136 | reported-exploit | Associated exploit source (IFIN compiled observables) (IFIN, Poppelgaard checker)
+78.190.152.64 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+80.240.22.229 | reported-exploit | Associated exploit source (IFIN compiled observables) (IFIN, Poppelgaard checker)
+81.10.79.197 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+82.167.14.7 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16, eSentire, Beazley, GreyNoise, Poppelgaard checker)
+87.224.84.82 | reported-exploit | configuration-staging attempt (LevelBlue, GreyNoise, Poppelgaard checker)
+89.36.231.206 | reported-exploit | Associated exploit source (IFIN compiled observables) (IFIN, Poppelgaard checker)
+91.195.240.123 | reported-exploit | Associated exploit source (IFIN compiled observables) (IFIN, Poppelgaard checker)
+92.118.204.229 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, LevelBlue, eSentire, GreyNoise, Poppelgaard checker)
+95.105.74.172 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+100.38.125.66 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+102.213.132.123 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+102.222.146.45 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+103.83.146.100 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+103.181.212.245 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+103.197.249.161 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+104.168.34.24 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+104.207.32.77 | reported-exploit | exploit delivery (Beazley, Poppelgaard checker)
+104.207.46.202 | reported-exploit | exploit delivery (Beazley, Poppelgaard checker)
+104.207.47.54 | reported-exploit | exploit delivery (Beazley, Poppelgaard checker)
+104.234.140.124 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+104.234.140.132 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+109.71.252.97 | reported-exploit | ns.conf-theft source (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+111.92.128.89 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+114.145.49.215 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+120.244.160.182 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+125.62.88.26 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+130.12.182.7 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16, Poppelgaard checker)
+130.94.106.141 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, GreyNoise)
+137.220.53.135 | reported-exploit | CVE-2026-88771 exploitation attempts (GreyNoise, 28-29 Sep); Huntback.io decoys saw it upload ns.conf (GreyNoise, Poppelgaard checker)
+138.28.234.38 | reported-exploit | exploitation with attempted DNS exfiltration (Lupovis) (Beazley, Lupovis, Poppelgaard checker)
+138.68.21.29 | reported-exploit | medium confidence: temporal and service-path correlation (Sygnia, Poppelgaard checker)
+138.199.60.5 | reported-exploit | sent CVE-2026-88779 crash payloads to /saml/login and /cgi/samlauth on 5 Oct (Gotham Technology Group) (Poppelgaard checker)
+138.199.60.22 | reported-exploit | sent CVE-2026-88771 injection checks to Huntback.io decoys (4 Oct) (Poppelgaard checker)
+138.199.60.36 | reported-exploit | sent CVE-2026-88771 injection checks to Huntback.io decoys (4 Oct) (Poppelgaard checker)
+139.59.86.242 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Poppelgaard checker)
+141.98.212.82 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+142.93.205.229 | reported-exploit | CVE-2026-88771 exploitation source (watchTowr honeypots); polled for the c88771.json success marker (watchTowr, GreyNoise, Poppelgaard checker)
+144.172.108.78 | reported-exploit | exploitation source (eSentire, Poppelgaard checker)
+146.70.199.170 | reported-exploit | sent CVE-2026-88771 injection checks to Huntback.io decoys (4 Oct) (Poppelgaard checker)
+149.28.29.221 | reported-exploit | exploitation source (eSentire, IFIN, Poppelgaard checker)
+149.104.78.141 | reported-exploit | exploitation source (eSentire, GreyNoise, Beazley, Poppelgaard checker)
+149.104.78.208 | reported-exploit | earliest exploitation attempt Rapid7 saw (20 Sep): tar of /flash/nsconfig to a web path (Rapid7, Poppelgaard checker)
+154.183.158.198 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+154.217.251.226 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Beazley, GreyNoise, Poppelgaard checker)
+154.241.254.9 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+157.254.167.12 | reported-exploit | CVE-2026-88772 exploitation and basic webshell backdoor (Mandiant, Beazley, Poppelgaard checker)
+158.94.209.12 | reported-exploit | exploitation source (eSentire, Poppelgaard checker)
+159.26.112.64 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+159.65.104.231 | reported-exploit | CVE-2026-88771 exploitation attempts (GreyNoise, 28-29 Sep); polled for the c88771.json success marker (GreyNoise, Poppelgaard checker)
+159.203.33.46 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Poppelgaard checker)
+162.243.36.88 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, LevelBlue, Poppelgaard checker)
+165.22.100.102 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+165.22.104.177 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+165.227.201.112 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, GreyNoise)
+165.227.228.21 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Poppelgaard checker)
+170.64.143.206 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Poppelgaard checker)
+170.64.176.26 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Sygnia, Poppelgaard checker)
+172.247.44.85 | reported-exploit | CVE-2026-88771 exploitation source (watchTowr honeypots); Huntback.io decoys saw it prove exploitation out of band (watchTowr, GreyNoise, Poppelgaard checker)
+173.40.135.209 | reported-exploit | source of NetScaler exploitation attempts (LevelBlue, Poppelgaard checker)
+174.60.63.37 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+177.52.203.23 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+183.63.88.227 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+185.100.87.166 | reported-exploit | Tunnel-dropper source (pinggy/serveo fronted droppers) (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+185.121.170.60 | reported-exploit | ns.conf-theft source (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+185.135.77.63 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+185.156.46.162 | reported-exploit | exploitation source (eSentire, GreyNoise, Poppelgaard checker)
+185.231.33.46 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Poppelgaard checker)
+185.243.218.225 | reported-exploit | ns.conf-theft source (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+185.244.213.112 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, Beazley, Poppelgaard checker)
+190.117.56.56 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+194.54.83.22 | reported-exploit | Out-of-band proving source (dnshook.site callbacks) (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+195.62.37.119 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+198.13.159.233 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, GreyNoise)
+204.8.96.74 | reported-exploit | ns.conf-theft source (Huntback.io decoys, 7 Oct) (Poppelgaard checker)
+206.189.107.84 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+207.48.184.10 | reported-exploit | source IP of the staged CVE-2026-88771 chain (INDEX: User-Agent staging, pitboss trigger) (Zscaler 2026-10-16)
+209.250.236.77 | reported-exploit | medium confidence: time-correlated with exploit-style activity (Sygnia, Poppelgaard checker)
+212.86.125.40 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr)
+216.203.21.233 | reported-exploit | CVE-2026-88771 exploitation source seen on watchTowr's honeypot sensors (watchTowr, eSentire, GreyNoise, Poppelgaard checker)
+23.234.80.246 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+23.234.83.194 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+23.234.109.28 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+31.56.197.137 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+64.176.71.42 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+66.173.222.26 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+79.133.42.141 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+85.11.187.35 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+91.199.163.55 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+103.214.20.54 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+109.136.126.142 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+135.136.98.176 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+139.162.75.170 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+139.162.83.159 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+143.244.44.177 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+146.70.199.53 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+159.223.233.184 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+167.88.172.6 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+194.127.166.126 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+207.148.105.57 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+"""
+REPORTED_IOC_IPS = [tuple(x.strip() for x in line.split("|", 2)) for line in _REPORTED_IOC_IPS.strip().splitlines()]
+BUILTIN_IOC_IPS = CASE_IOC_IPS + [x for x in REPORTED_IOC_IPS if x[0] not in {c[0] for c in CASE_IOC_IPS}]
 SUPPLIED_IOC = ("supplied", "given with -IocIp / --ioc-ip for this run")
 
 KNOWN_IOC_PATHS = [
-    ("/flash/nsconfig/.slap", "Hidden implant folder: agent.pl, bridge.pl, boot.sh and copies of the PHP webshell"),
-    ("/flash/nsconfig/.relay", "Relay component folder (reverse SSH tunnel and SOCKS proxy, guard.sh)"),
+    ("/flash/nsconfig/.slap", "Hidden implant folder: agent.pl, bridge.pl, boot.sh and copies of the PHP webshell; Rapid7 "
+                              "(2026-10-19) also lists reverse-agent.sh, vcscan-agent.sh and vc here"),
+    ("/flash/nsconfig/.relay", "Relay component folder (reverse SSH tunnel and SOCKS proxy, guard.sh); Rapid7 (2026-10-19) "
+                               "also lists run.sh and target_agent.py here"),
+    ("/flash/.nsvm", "nsvmd FreeBSD Go proxy folder (Rapid7, 2026-10-19): nsvmd, watchdog.sh, guard.sh, restart.sh, "
+                     ".agent.log, .wd.log; nsvmd talks to v5v.in / 209.74.64.192"),
+    ("/var/tmp/.s2loot", "Loot staging folder of the same implant (Rapid7, 2026-10-19); this tool's own case had the log "
+                         "file /var/tmp/.s2loot.log instead"),
     ("/var/nstmp/.relay", "Relay component folder (alternate location)"),
     ("/var/tmp/.ux", "Tunnel agent folder: agent.log, slapshot.py, whipd.py and pid files"),
     ("/var/tmp/.s2loot.log", "Log of nsconfig archives made by the implant (archive=nsconfig ... valid=yes)"),
@@ -108,8 +308,8 @@ KNOWN_IOC_PATHS = [
     ("/flash/nsconfig/rc.netscaler.ptbak", "Copy of rc.netscaler kept when rc.netscaler was rewritten (holds the earlier version)"),
 ]
 KNOWN_IOC_RX = re.compile(
-    r"(^|/)\.(slap|relay|ux)(/|$)"
-    r"|^/var/tmp/\.(slap-[^/]+|s2loot\.log|relay-(ssh|socks)\.log)$"
+    r"(^|/)\.(slap|relay|ux)(/|$)|^/flash/\.nsvm(/|$)"
+    r"|^/var/tmp/\.(slap-[^/]+|relay-(ssh|socks)\.log)$|^/var/tmp/\.s2loot(\.log$|/|$)"
     r"|/LogonPoint/custom/(\.ctxs\.receiver|\.slap\.receiver|receiver\.deb)$"
     r"|^/var/cron/tabs/nobody$|^/flash/nsconfig/rc\.netscaler\.ptbak$"
 )
@@ -117,10 +317,10 @@ KNOWN_IOC_RX = re.compile(
 IMPLANT_LOG_EXPORTS = [
     "/var/tmp/.ux/agent.log", "/var/tmp/.ux/whip.log", "/var/tmp/.relay-ssh.log", "/var/tmp/.relay-socks.log",
     "/var/tmp/.s2loot.log", "/var/tmp/.slap-diag.txt", "/var/tmp/.slap-agent.log", "/var/tmp/.slap-watch.log",
-    "/var/tmp/.slap-httpd-test.log",
+    "/var/tmp/.slap-httpd-test.log", "/flash/.nsvm/.agent.log", "/flash/.nsvm/.wd.log",
 ]
 IMPLANT_STRINGS = (r"\.slap|/\.ux/|slapshot|whipd|receiver\.deb|ctxs\.receiver|slap\.receiver|CsrfToken|\.relay|guard\.sh"
-                   r"|s2loot")
+                   r"|s2loot|nsvmd|\.nsvm|v5v\.in|vcscan|reverse-agent")
 
 # Hunt sections A-I: file name filters and patterns, case-insensitive. Only files directly in /var/log are read, except
 # for H, which reads every exported text log. H is built from BUILTIN_IOC_IPS plus --ioc-ip.
@@ -1066,10 +1266,26 @@ def ip_regex(ips):
     return re.compile("(" + "|".join(pats) + ")", re.I) if pats else None
 
 
+class IpMatcher:
+    """Finds any of the attacker IPs in a line as a whole address. IPv4 candidates are looked up in a set, so hundreds
+    of IPs cost no more than a few; IPv6 IOCs use a regex. search() returns a match whose group(1) is the IP, or None."""
+
+    def __init__(self, ips):
+        self.v4 = {ip for ip in ips if ":" not in ip}
+        self.v6 = ip_regex([ip for ip in ips if ":" in ip])
+
+    def search(self, text):
+        if self.v4:
+            for m in IPV4_RX.finditer(text):
+                if m.group(1) in self.v4:
+                    return m
+        return self.v6.search(text) if self.v6 is not None else None
+
+
 class Hunts:
     def __init__(self, ioc_ips):
         self.ioc_ips = dict(ioc_ips)          # {ip: (level, note)}
-        self.ip_rx = ip_regex(self.ioc_ips)
+        self.ip_rx = IpMatcher(self.ioc_ips) if self.ioc_ips else None
         self.sections = []
         for key, sheet, title, pats, rx in SECTIONS:
             crx = self.ip_rx if key == "H" else re.compile(rx, re.I)
@@ -1672,9 +1888,11 @@ def write_workbook(res, path, args):
         "Implant_Strings_by_File, FoxIT_iocitrix, Timeline, Log_Inventory, Export_Manifest.",
         "Every exported log is also saved as its own .xlsx under logs_xlsx (same folder layout as the image).",
         "Line numbers refer to the exported log files under logs (decompressed for .gz).",
-        "Hunt H searches every log for the built-in attacker IPs (from the intrusion this tool was built on) plus any "
-        "given with -IocIp. The Level column says how sure that list is: confirmed, likely, suspected (may be a scanner) "
-        "or supplied. A hit is a lead: read the log line before calling it attacker activity.",
+        "Hunt H searches every log for the built-in attacker IPs (the intrusion this tool was built on, plus public "
+        f"reporting up to {REPORTED_AS_OF}) and any given with -IocIp. Level: confirmed, likely or suspected (may be a "
+        "scanner) for the tool's own case; reported-infra (publicly reported C2, payload, staging or exfiltration "
+        "server); reported-exploit (publicly reported exploit source or webshell user); supplied (-IocIp). A hit is a "
+        "lead: read the log line before calling it attacker activity.",
         "Syslog lines carry no year or zone: the year comes from the file's modified time. " + res.get("clock_note", ""),
         "agent.log lines carry only HH:MM:SS: dates are inferred backwards from the file's modified time; days with no "
         "lines cannot be detected, so treat the dates of older lines as approximate.",
@@ -1687,7 +1905,10 @@ def write_workbook(res, path, args):
             ["Known IOC paths present", f"{len([r for r in present if r['query'] == r['path']])} of {len(KNOWN_IOC_PATHS)}"],
             ["Flagged hook lines", len(flagged)], ["Discovery IOCs and leads", len(leads)]]
     n_sup = sum(1 for lv, _n in h.ioc_ips.values() if lv == SUPPLIED_IOC[0])
-    summ.append(["Attacker IPs searched (hunt H)", f"{len(h.ioc_ips) - n_sup} built in + {n_sup} supplied with -IocIp"])
+    n_rep = sum(1 for lv, _n in h.ioc_ips.values() if lv.startswith("reported"))
+    summ.append(["Attacker IPs searched (hunt H)",
+                 f"{len(h.ioc_ips) - n_sup} built in ({len(h.ioc_ips) - n_sup - n_rep} from the tool's own case, {n_rep} "
+                 f"from public reporting up to {REPORTED_AS_OF}) + {n_sup} supplied with -IocIp"])
     for s in res["sections"]:
         summ.append([f"Hunt {s['key']}: {s['title']}", s["count"]])
     summ += [["Distinct injected commands (NSPPE;)", len(res["nsppe"])],
@@ -1895,9 +2116,12 @@ def write_docx(path, run, results):
             bullet(n)
     iocs = run.get("ioc_ips", {})
     sup = iocs.get("supplied", [])
-    para(f"Hunt H searched every log for {len(iocs.get('built_in', []))} built-in attacker IPs (from the intrusion this "
-         "tool was built on)" + (f" and {len(sup)} supplied with -IocIp ({', '.join(sup)})" if sup else "")
-         + ". The H_Attacker_IP_Lines sheet gives each IP's level: confirmed, likely, suspected or supplied.", italic=True)
+    sup_txt = ", ".join(sup[:20]) + (f" and {len(sup) - 20} more" if len(sup) > 20 else "")
+    para(f"Hunt H searched every log for {len(iocs.get('built_in', []))} built-in attacker IPs ({len(CASE_IOC_IPS)} from "
+         f"the intrusion this tool was built on, {len(iocs.get('built_in', [])) - len(CASE_IOC_IPS)} from public reporting "
+         f"up to {REPORTED_AS_OF})" + (f" and {len(sup)} supplied with -IocIp ({sup_txt})" if sup else "")
+         + ". The H_Attacker_IP_Lines sheet gives each IP's level (confirmed, likely, suspected, reported-infra, "
+         "reported-exploit or supplied) and what it was seen doing.", italic=True)
 
     hashes = collections.defaultdict(set)
     for r in results:
@@ -2145,8 +2369,10 @@ def main():
            "args": dict(vars(args)), "ioc_ips": {"built_in": builtin, "supplied": extra}, "notes": [], "caveats": []}
     args.ioc_table = ioc_ip_table(extra)
     say(f"nshunt_engine {ENGINE_VERSION}: evidence {src}, output {out}")
-    say(f"attacker IPs searched (hunt H): {len(builtin)} built in"
-        + (f" + {len(extra)} supplied: {', '.join(extra)}" if extra else ""))
+    say(f"attacker IPs searched (hunt H): {len(builtin)} built in ({len(CASE_IOC_IPS)} from the tool's own case, "
+        f"{len(builtin) - len(CASE_IOC_IPS)} from public reporting up to {REPORTED_AS_OF})"
+        + (f" + {len(extra)} supplied: {', '.join(extra[:20])}" + (f" and {len(extra) - 20} more" if len(extra) > 20 else "")
+           if extra else ""))
     cands, notes = discover(src)
     run["notes"] = notes
     for n in notes:

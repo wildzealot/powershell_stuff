@@ -1,6 +1,6 @@
 # NetScaler Hunt (Invoke-NetScalerHunt.ps1)
 
-Version 1.1.0
+Version 1.2.0
 
 One PowerShell script for Windows that hunts Citrix NetScaler (ADC / Gateway) disk images for signs of compromise.
 Point it at a folder of images, or at one image file. It installs what it needs, opens every image read-only,
@@ -91,17 +91,22 @@ Every run checks every image for all of the following. Nothing has to be configu
 - Logins from `utx.log*`, log files containing runs of NUL bytes (often a sign of truncation), and Fox-IT
   iocitrix (webshells, timestomping, cron jobs, SUID binaries).
 
-**Known indicators from the intrusion this tool was built on** (October 2026: CVE-2026-88771 log poisoning, then a
-webshell, tunnels and configuration theft)
+**Known indicators** from the intrusion this tool was built on (October 2026: CVE-2026-88771 log poisoning, then a
+webshell, tunnels and configuration theft) and from public reporting up to 2026-10-19
 
-- 19 known implant and persistence paths, with SHA-256 and times, and whether each is also on the base
+- 21 known implant and persistence paths, with SHA-256 and times, and whether each is also on the base
   (pre-snapshot) disk: the hidden folders `/flash/nsconfig/.slap`, `/flash/nsconfig/.relay` and `/var/tmp/.ux`
   (which held `slapshot.py` and `whipd.py`), the logs `/var/tmp/.s2loot.log`, `.relay-ssh.log`, `.relay-socks.log`
   and `.slap-*`, the webshell copies `.ctxs.receiver`, `.slap.receiver` and `receiver.deb` under
-  `/var/netscaler/logon/LogonPoint/custom/`, the `nobody` crontab and `rc.netscaler.ptbak`.
+  `/var/netscaler/logon/LogonPoint/custom/`, the `nobody` crontab and `rc.netscaler.ptbak`. From Rapid7's
+  2026-10-19 report on the same implant: the nsvmd Go proxy folder `/flash/.nsvm/` (its `.agent.log` and `.wd.log`
+  are exported) and the loot folder `/var/tmp/.s2loot/`; Rapid7 also lists `reverse-agent.sh`, `vcscan-agent.sh` and
+  `vc` inside `.slap`, and `run.sh` and `target_agent.py` inside `.relay` (everything inside those folders is listed
+  and hashed).
 - E, E2: requests to those webshell paths and to other probe paths; F: `.relay` installer lines; G: cron runs of
   the implant; the implant's tunnel log (`agent.log`) and the destinations it reached.
-- H: every log line that mentions an attacker IP. These are built in, and `-IocIp` adds more:
+- H: every log line that mentions one of 189 built-in attacker IPs, and `-IocIp` adds more. The 10 IPs from the
+  intrusion this tool was built on:
 
 | IP | Level | Seen doing (2026-10) |
 |---|---|---|
@@ -116,10 +121,24 @@ webshell, tunnels and configuration theft)
 | 23.234.94.126 | suspected | probed this implant's webshell paths |
 | 68.235.46.82 | suspected | probed this implant's webshell paths |
 
-"Suspected" IPs only probed for the webshell files and could be scanners that know those paths. Every hit is a lead:
-read the log line before you call it attacker activity. The H sheet shows each IP's level (`supplied` for IPs
-given with `-IocIp`). To change the built-in list, edit `BUILTIN_IOC_IPS` in `src/nshunt_engine.py` and rebuild
-(see "Building from source").
+"Suspected" IPs only probed for the webshell files and could be scanners that know those paths (the webshell names
+were in public community reporting by 2026-10-02). 146.70.211.157 and 23.162.8.173 were also seen sending
+CVE-2026-88771 injection checks to Huntback.io decoys.
+
+The other 179 come from public reporting up to 2026-10-19: Rapid7, Zscaler, watchTowr, Unit 42, LevelBlue, eSentire,
+Mandiant, GreyNoise, Arctic Wolf, Sygnia, Truesec, Beazley, TENEX, SOCRadar, Lupovis, Corelight, IFIN, and the
+Poppelgaard NetScaler checker (which relays Gotham Technology Group incident-response data and Huntback.io decoy
+data). They have two levels:
+
+| Level | Count | What it means |
+|---|---|---|
+| `reported-infra` | 38 | C2, payload, staging or exfiltration servers. A NetScaler or internal host talking to one of these is a strong lead. Includes Rapid7's infrastructure for this same implant: 192.159.99.139 (.slap C2, relay and loot upload), 45.92.1.17 (stage and loot server), 209.74.64.192 (nsvmd C2) and 179.60.146.241 (served 1.sh). |
+| `reported-exploit` | 141 | Exploit sources and webshell users named by vendor or incident-response reports, such as watchTowr's and Zscaler's source IPs and Unit 42's webshell users. Many are VPN, cloud or home addresses, so a hit shows targeting, not compromise. |
+
+Mass-scan feeds, Tor exit relays and Cloudflare WARP addresses are left out because ordinary users share them. Every
+hit is a lead: read the log line before you call it attacker activity. The H sheet shows each IP's level and what it
+was seen doing, with its sources (`supplied` for IPs given with `-IocIp`). To change the lists, edit
+`CASE_IOC_IPS` or the `_REPORTED_IOC_IPS` block in `src/nshunt_engine.py` and rebuild (see "Building from source").
 
 ## What it does
 
@@ -251,10 +270,24 @@ files plain ASCII: Windows PowerShell 5.1 reads a file without a byte order mark
   `.E02`). Exit codes, `-IocIp` checks (including IPv6 and a file with comments), output folder checks, the default
   output name and the run-only SHA256SUMS were checked. PSScriptAnalyzer found no Windows PowerShell 5.1
   compatibility problems.
-- Not yet done for 1.1.0: a run on Windows, a run against a real raw or E01 NetScaler image, and a run on one
-  snapshot `.vmdk` given directly as `-Path`.
+- 1.2.0 repeated those tests with a publicly reported IP of each level, a `/flash/.nsvm/` folder and a
+  `/var/tmp/.s2loot/` folder added to the test disk. All four formats gave identical results, the H sheet showed the
+  `reported-infra` and `reported-exploit` levels, both new paths were flagged and the nsvmd logs were exported.
+  With 189 IPs, matching 300,000 log lines took 1.7 seconds (the 1.1.0 matching method took 161 seconds with the
+  same list).
+- Not yet done for 1.1.0 and 1.2.0: a run on Windows, a run against a real raw or E01 NetScaler image, and a run on
+  one snapshot `.vmdk` given directly as `-Path`.
 
 ## Changes
+
+**1.2.0** (2026-10-19)
+
+- 179 attacker IPs from public reporting are now built in (levels `reported-infra` and `reported-exploit`), next to
+  the 10 from the tool's own case, so every run checks 189 IPs plus any given with `-IocIp`. Each H hit shows what
+  the IP was seen doing and who reported it.
+- New known paths from Rapid7's report on the same implant: `/flash/.nsvm/` (nsvmd) and `/var/tmp/.s2loot/`. The
+  nsvmd logs are exported, and nsvmd, v5v.in and the new script names are added to the implant-string search.
+- IP matching now looks each IPv4 address up in a set, so the larger list does not slow the log pass.
 
 **1.1.0** (2026-10-19)
 
