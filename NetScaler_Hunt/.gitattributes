@@ -1,0 +1,2 @@
+# Keep these files byte for byte (CRLF in the .ps1, LF elsewhere) so SHA256SUMS.txt matches after a clone.
+* -text
