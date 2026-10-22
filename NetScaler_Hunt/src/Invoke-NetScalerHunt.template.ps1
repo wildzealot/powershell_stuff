@@ -11,14 +11,16 @@
        raw dd images, split raw images and E01 sets (every part or segment is checked first);
     3. exports /var/log and the known implant's text logs, with SHA-256 and original UTC times (export_manifest.csv);
     4. converts EVERY exported log to .xlsx (.gz rotations included; utx.log login records parsed into rows);
-    5. runs the hunts: known IOC files with hashes, boot and cron hooks, a hidden / new file sweep, log hunts A to I,
+    5. runs the hunts: known IOC files with hashes, boot and cron hooks, persistent /etc overrides in /nsconfig
+       (httpd.conf, crontab), a hidden / new file sweep with a web shell content and hash check, log hunts A to I,
        PITBOSS log poisoning (forged pitboss / NSPPE records, the Call Home lines that run them, base64 payloads
-       staged in the User-Agent), tunnel log, logins, NUL-byte runs in logs, network indicators and Fox-IT iocitrix;
+       staged in the User-Agent), core dumps, tunnel log, logins, NUL-byte runs in logs, network indicators and
+       Fox-IT iocitrix;
     6. writes <label>_Hunt_Results.xlsx per appliance and NetScaler_Findings_Summary.docx.
-  The generic hunts (PITBOSS log poisoning, crash loops, hidden and new files, boot and cron hooks, shell history,
-  log truncation) run on every image, and the known implant paths and attacker IPs are always checked as well: 189
-  built-in IPs, the 10 from the intrusion this tool was built on plus 179 C2, payload, exfiltration and exploit
-  sources from public reporting up to 2026-10-19.
+  The generic hunts (PITBOSS log poisoning, crash loops, hidden and new files, web shells hidden in non-PHP files,
+  boot and cron hooks, shell history, log truncation) run on every image, and the known implant paths, file hashes
+  and attacker IPs are always checked as well: 192 built-in IPs, the 10 from the intrusion this tool was built on
+  plus 182 C2, payload, exfiltration, exploit and other IOC addresses from public reporting up to 2026-10-19.
   Nothing is written inside the evidence folder. Implant scripts and webshells are recorded by hash only and are
   never exported.
 
@@ -39,7 +41,7 @@
   Default: 30 days before the newest log on each image.
 .PARAMETER IocIp
   Extra attacker IPs (IPv4 or IPv6) to search every log for, such as IPs from the new client's own alerts. They
-  are added to the 189 built-in IPs (this tool's own case plus public reporting), which are always searched.
+  are added to the 192 built-in IPs (this tool's own case plus public reporting), which are always searched.
   Give a list (-IocIp 203.0.113.10, 198.51.100.7) or read a text file with one IP per line
   (-IocIp (Get-Content .\client_ips.txt)); blank lines and text after # are ignored.
 .PARAMETER PythonExe
@@ -95,7 +97,7 @@
 
   Raw image, extra attacker IPs read from a text file (one per line), Fox-IT checks skipped for a quicker run.
 .NOTES
-  Version 1.3.0. Works in Windows PowerShell 5.1 and PowerShell 7. Engine SHA-256 (LF line endings):
+  Version 1.3.1. Works in Windows PowerShell 5.1 and PowerShell 7. Engine SHA-256 (LF line endings):
   __ENGINE_SHA256__
 #>
 [CmdletBinding()]
@@ -116,7 +118,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ToolVersion = '1.3.0'
+$ToolVersion = '1.3.1'
 $EngineSha256 = '__ENGINE_SHA256__'
 $PythonVersion = '3.13.16'
 $Packages = @('dissect==3.22', 'tabulate==0.10.0', 'XlsxWriter==3.2.9', 'python-docx==1.2.0')

@@ -1,6 +1,6 @@
 # NetScaler Hunt (Invoke-NetScalerHunt.ps1)
 
-Version 1.3.0
+Version 1.3.1
 
 One PowerShell script for Windows that hunts Citrix NetScaler (ADC / Gateway) disk images for signs of compromise.
 Point it at a folder of images, or at one image file. It installs what it needs, opens every image read-only,
@@ -91,27 +91,53 @@ Every run checks every image for all of the following. Nothing has to be configu
   - A: Call Home crash checker lines (`callhomedebug.log`) that carry an injected command. On an unpatched appliance
     the checker (`/netscaler/ns_monuploadd_err.pl`) runs the text after NSPPE.
   - B2: web requests whose User-Agent holds a base64 payload, the stage 1 step that the injected command fetches
-    from the access log and runs (`INDEX:` and `K:` markers, base64 of `<?php`, or any long base64 run). The B2
-    sheet gives what each payload decodes to (shell commands, PHP code, text or binary), its SHA-256 (checked
-    against Unit 42's published hashes) and the URLs and IPs inside it. The decoded content is never written out.
+    from the access log and runs: `INDEX:` and `K:` markers, base64 of `<?php`, any long base64 run, and any word of
+    8 or more base64 characters that decodes to readable text with a command, URL or PHP code in it (so a short
+    dropper such as base64 of `curl http://.../x|sh` is caught too). The B2 sheet gives what each payload decodes
+    to (shell commands, PHP code, text or binary), its SHA-256 (checked against Unit 42's published hashes) and the
+    URLs and IPs inside it. The decoded content is never written out.
   - Pitboss_Injections groups A and B by injected command (URL-decoded), with the client IPs of the forged logins
     and the URLs, domains and IPs inside each command.
 - C, D: genuine pitboss records: nsaaad crash loops, restart limits and reboots, and packet engine (NSPPE) crashes.
   Forged records are kept out of C and D.
-- Boot script (`rc.netscaler*`, `nsbefore.sh`, `nsafter.sh`) and crontab lines. These files are normal on a
-  NetScaler (administrators put settings such as `nsapimgr_wr.sh` tuning in `rc.netscaler`), so a line is a finding
-  only when it is flagged: it runs something from a hidden folder or /tmp, starts a background process, uses
-  network or encoding tools, contains an IP address or names a known implant file. A file created or modified in
-  the review window, and a crontab whose header says it was installed in the window, are flagged too. The Word
-  summary shows only flagged lines; every line is on the Hooks sheet.
+- Boot script (`rc.netscaler*`, `nsbefore.sh`, `nsafter.sh`) and crontab lines, including `/flash/nsconfig/crontab`
+  (the persistent copy of `/etc/crontab`). These files are normal on a NetScaler (administrators put settings such
+  as `nsapimgr_wr.sh` tuning in `rc.netscaler`), so a line is a finding only when it is flagged: it runs something
+  from a hidden folder or /tmp, starts a background process, uses network or encoding tools, contains an IP
+  address, names a known implant file, edits `httpd.conf`, turns the PHP engine on, reloads the web server, or sets
+  a setuid or setgid bit (Unit 42's actor set the setuid bit on `/bin/sh` and patched `httpd.conf`; a boot script
+  is how such changes would come back after a reboot). A file created or modified in the review window, and a
+  crontab whose header says it was installed in the window, are flagged too. The Word summary shows only flagged
+  lines; every line is on the Hooks sheet.
+- `/flash/nsconfig/httpd.conf`, the persistent copy of `/etc/httpd.conf` (Citrix CTX327915: a customized /etc file
+  copied to /nsconfig is linked back into /etc at boot). Only lines that match what Unit 42 describes are listed:
+  `php_flag engine on` (with the trailing space the actor's one-line edit leaves, when no `engine off` line is left,
+  or for the Gateway logon folder), aliases to a hidden file or a `receiver.min` name, a `Files` block for a hidden
+  file, and PHP handlers for non-PHP file types.
 - A sweep of `/flash` and `/var` for hidden items, implant-like names and files created in the review window
-  (Discovery sheet). Files in the VPN and EPA client download folders (`/var/netscaler/gui/vpn/scripts/linux/`,
-  `/var/netscaler/gui/epa/scripts/linux/`) are checked as well: a `.deb` or `.rpm` that is not a real package, and
-  the package names Unit 42 reported as this actor's webshells, are leads.
+  (Discovery sheet), with these content checks:
+  - PHP code (`<?php` or `<?=`) inside files that are not `.php` in the web folders: every file under
+    `/var/netscaler/logon` and `/var/vpn`, and static file types, extension-less and hidden files under
+    `/var/netscaler/gui`. This actor hid its web shells this way (`.ctxs.receiver`, package-named `.deb` files) and
+    reached them through aliases; Fox-IT only inspects `.php` files.
+  - The VPN and EPA client download folders (`/var/netscaler/gui/vpn/scripts/linux/`,
+    `/var/netscaler/gui/epa/scripts/linux/`): a `.deb` or `.rpm` that is not a real package, and the package names
+    Unit 42 reported as this actor's webshells, are leads.
+  - SHA-256 of files in the web folders outside the GUI tree, the client download folders and `/var/tmp`,
+    `/var/nstmp` (up to 20 MB each), compared with Unit 42's three published hashes.
+  - `/var/netscaler/logon/LogonPoint/custom/` created in the review window (Unit 42: the actor's drop folder).
+- Core and crash dumps in `/var/core` and `/var/crash`, with times (Core_Dumps sheet and timeline), to line up with
+  the C and D crash records: Unit 42 says the CVE-2026-88772 DTLS exploit causes memory corruption or a crash.
 - I: suspicious shell history (curl, fetch, ssh, scp, tar, crontab, truncation, deletes, and more), with a view of
   each distinct command, rarest first; rare commands in the shell audit log.
 - Logins from `utx.log*`, log files containing runs of NUL bytes (often a sign of truncation), and Fox-IT
   iocitrix (webshells, timestomping, cron jobs, SUID binaries).
+
+**What a disk image cannot show.** The appliance's root file system, including `/etc` and `/bin`, lives in RAM and is
+rebuilt at every boot, so the live `/etc/httpd.conf` edits, the PHP engine switch, the httpd reload and the setuid
+bit on `/bin/sh` that Unit 42 describes are only visible on the disk if they were made persistent (the checks above
+cover the persistent copies and boot scripts). The web shell's `CsrfToken` and `NSC_TASS` cookies and its no-cache
+response headers are not in NetScaler's access log. For those, use a memory capture or the live appliance.
 
 **Known indicators** from the intrusion this tool was built on (October 2026: CVE-2026-88771 log poisoning, then a
 webshell, tunnels and configuration theft) and from public reporting up to 2026-10-19
@@ -132,7 +158,9 @@ webshell, tunnels and configuration theft) and from public reporting up to 2026-
   and `nsg64.deb` under `/vpn/scripts/linux/` (the real Ubuntu client is `nsgclient18_64.deb` and is not matched);
   F: `.relay` installer lines; G: cron runs of the implant; the implant's tunnel log (`agent.log`) and the
   destinations it reached.
-- H: every log line that mentions one of 189 built-in attacker IPs, and `-IocIp` adds more. The 10 IPs from the
+- Unit 42's three published SHA-256 values (the stage 1 base64 payload, the shell script it decodes to, and the
+  `nsg64.deb` web shell), compared with staged User-Agent payloads (B2) and with files on disk (Discovery).
+- H: every log line that mentions one of 192 built-in attacker IPs, and `-IocIp` adds more. The 10 IPs from the
   intrusion this tool was built on:
 
 | IP | Level | Seen doing (2026-10) |
@@ -152,23 +180,23 @@ webshell, tunnels and configuration theft) and from public reporting up to 2026-
 were in public community reporting by 2026-10-02). 146.70.211.157 and 23.162.8.173 were also seen sending
 CVE-2026-88771 injection checks to Huntback.io decoys.
 
-The other 179 come from public reporting up to 2026-10-19: Rapid7, Zscaler, watchTowr, Unit 42, LevelBlue, eSentire,
+The other 182 come from public reporting up to 2026-10-19: Rapid7, Zscaler, watchTowr, Unit 42, LevelBlue, eSentire,
 Mandiant, GreyNoise, Arctic Wolf, Sygnia, Truesec, Beazley, TENEX, SOCRadar, Lupovis, Corelight, IFIN, and the
 Poppelgaard NetScaler checker (which relays Gotham Technology Group incident-response data and Huntback.io decoy
-data). They have two levels:
+data). They have three levels:
 
 | Level | Count | What it means |
 |---|---|---|
 | `reported-infra` | 38 | C2, payload, staging or exfiltration servers. A NetScaler or internal host talking to one of these is a strong lead. Includes Rapid7's infrastructure for this same implant: 192.159.99.139 (.slap C2, relay and loot upload), 45.92.1.17 (stage and loot server), 209.74.64.192 (nsvmd C2) and 179.60.146.241 (served 1.sh). |
 | `reported-exploit` | 141 | Exploit sources and webshell users named by vendor or incident-response reports, such as watchTowr's and Zscaler's source IPs and Unit 42's webshell users. Many are VPN, cloud or home addresses, so a hit shows targeting, not compromise. |
+| `reported-ioc` | 3 | In a vendor's IOC table with no stated role: 45.61.136.143, 66.227.183.84 and 216.245.184.164 from Unit 42's network indicators. |
 
 Mass-scan feeds, Tor exit relays and Cloudflare WARP addresses are left out because ordinary users share them, except
 the four WARP addresses Unit 42 tied to this actor's webshell and GetUserName requests (104.28.215.136,
 104.28.215.137, 104.28.247.136, 104.28.247.137), which are in as `reported-exploit`; a hit on one of those is weak on
-its own. Three IPs in Unit 42's indicator table with no stated role (45.61.136.143, 66.227.183.84,
-216.245.184.164) are not built in; add them with `-IocIp` if you want them searched. Every hit is a lead: read the
-log line before you call it attacker activity. The H sheet shows each IP's level and what it
-was seen doing, with its sources (`supplied` for IPs given with `-IocIp`). To change the lists, edit
+its own. All 18 IPs Unit 42 names in its report are built in. Every hit is a lead: read the log line before you
+call it attacker activity. The H sheet shows each IP's level and what it was seen doing, with its sources
+(`supplied` for IPs given with `-IocIp`). To change the lists, edit
 `CASE_IOC_IPS` or the `_REPORTED_IOC_IPS` block in `src/nshunt_engine.py` and rebuild (see "Building from source").
 
 ## What it does
@@ -317,10 +345,35 @@ files plain ASCII: Windows PowerShell 5.1 reads a file without a byte order mark
   produced no findings. All four formats gave identical results again, and the exit codes were checked with
   `-File`. Matching 300,000 ordinary log lines took 0.1 seconds for B and 150,000 access-log lines 0.4 seconds for
   B2.
-- Not yet done for 1.1.0 to 1.3.0: a run on Windows, a run against a real raw or E01 NetScaler image, and a run on
+- 1.3.1 added to the test disk: two short User-Agent payloads (a whole-agent base64 command and a base64 word after
+  a normal agent) next to 21 ordinary agents; a renamed web shell (`style.min.css` with PHP inside) and PHP inside a
+  bookmark XML, next to stock-like JS, XML and `.php` files; a persistent `httpd.conf` with Unit 42's changes and
+  a persistent crontab; boot-script lines that patch `httpd.conf`, reload httpd and set the setuid bit on
+  `/bin/sh`; and core dumps. The clean disk gained an administrator's hardening `httpd.conf`, a persistent crontab,
+  a boot script that copies `httpd.conf`, stock-like web files and a genuine packet engine core, and still
+  produced no findings. A third disk checked that a `LogonPoint/custom/` folder created in the review window is a
+  lead, and a run with a test value added to the hash list checked the published-hash match. The short-payload
+  rule flagged none of 1.2 million random base64-like words. On a disk with 14,500 web and temp files, the new
+  content and hash checks added 1.3 seconds.
+- Not yet done for 1.1.0 to 1.3.1: a run on Windows, a run against a real raw or E01 NetScaler image, and a run on
   one snapshot `.vmdk` given directly as `-Path`.
 
 ## Changes
+
+**1.3.1** (2026-10-22): closes the gaps against Unit 42's report on these zero-days.
+
+- B2 also catches short base64 payloads: any User-Agent word of 8 or more base64 characters that decodes to
+  readable text with a command, URL or PHP code in it. 1.3.0 needed a marker or a run of 60 characters.
+- Web shells hidden in other files: PHP code inside non-PHP files in the web folders is a lead, whoever owns the
+  file, and files in the web, client download and temp folders are compared with Unit 42's three published
+  SHA-256 values (now including `nsg64.deb`). The Discovery sheet gains a SHA-256 column.
+- Persistence: `/flash/nsconfig/httpd.conf` is checked for the changes Unit 42 describes, `/flash/nsconfig/crontab`
+  joins the boot script and crontab review, and boot-script lines that edit `httpd.conf`, turn the PHP engine on,
+  reload the web server or set a setuid or setgid bit are flagged. A `LogonPoint/custom/` folder created in the
+  review window is a lead.
+- New Core_Dumps sheet: core and crash dumps in `/var/core` and `/var/crash` with times, also on the timeline.
+- The three remaining IPs from Unit 42's indicator table are built in at a new level, `reported-ioc` (192 IPs in
+  total).
 
 **1.3.0** (2026-10-22)
 

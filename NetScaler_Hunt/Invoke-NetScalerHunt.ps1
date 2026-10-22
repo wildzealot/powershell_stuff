@@ -11,14 +11,16 @@
        raw dd images, split raw images and E01 sets (every part or segment is checked first);
     3. exports /var/log and the known implant's text logs, with SHA-256 and original UTC times (export_manifest.csv);
     4. converts EVERY exported log to .xlsx (.gz rotations included; utx.log login records parsed into rows);
-    5. runs the hunts: known IOC files with hashes, boot and cron hooks, a hidden / new file sweep, log hunts A to I,
+    5. runs the hunts: known IOC files with hashes, boot and cron hooks, persistent /etc overrides in /nsconfig
+       (httpd.conf, crontab), a hidden / new file sweep with a web shell content and hash check, log hunts A to I,
        PITBOSS log poisoning (forged pitboss / NSPPE records, the Call Home lines that run them, base64 payloads
-       staged in the User-Agent), tunnel log, logins, NUL-byte runs in logs, network indicators and Fox-IT iocitrix;
+       staged in the User-Agent), core dumps, tunnel log, logins, NUL-byte runs in logs, network indicators and
+       Fox-IT iocitrix;
     6. writes <label>_Hunt_Results.xlsx per appliance and NetScaler_Findings_Summary.docx.
-  The generic hunts (PITBOSS log poisoning, crash loops, hidden and new files, boot and cron hooks, shell history,
-  log truncation) run on every image, and the known implant paths and attacker IPs are always checked as well: 189
-  built-in IPs, the 10 from the intrusion this tool was built on plus 179 C2, payload, exfiltration and exploit
-  sources from public reporting up to 2026-10-19.
+  The generic hunts (PITBOSS log poisoning, crash loops, hidden and new files, web shells hidden in non-PHP files,
+  boot and cron hooks, shell history, log truncation) run on every image, and the known implant paths, file hashes
+  and attacker IPs are always checked as well: 192 built-in IPs, the 10 from the intrusion this tool was built on
+  plus 182 C2, payload, exfiltration, exploit and other IOC addresses from public reporting up to 2026-10-19.
   Nothing is written inside the evidence folder. Implant scripts and webshells are recorded by hash only and are
   never exported.
 
@@ -39,7 +41,7 @@
   Default: 30 days before the newest log on each image.
 .PARAMETER IocIp
   Extra attacker IPs (IPv4 or IPv6) to search every log for, such as IPs from the new client's own alerts. They
-  are added to the 189 built-in IPs (this tool's own case plus public reporting), which are always searched.
+  are added to the 192 built-in IPs (this tool's own case plus public reporting), which are always searched.
   Give a list (-IocIp 203.0.113.10, 198.51.100.7) or read a text file with one IP per line
   (-IocIp (Get-Content .\client_ips.txt)); blank lines and text after # are ignored.
 .PARAMETER PythonExe
@@ -95,8 +97,8 @@
 
   Raw image, extra attacker IPs read from a text file (one per line), Fox-IT checks skipped for a quicker run.
 .NOTES
-  Version 1.3.0. Works in Windows PowerShell 5.1 and PowerShell 7. Engine SHA-256 (LF line endings):
-  ec8537fcd1a52f33661520f4d13ff95714fb5e8b2561239eb3c3e889556cad8d
+  Version 1.3.1. Works in Windows PowerShell 5.1 and PowerShell 7. Engine SHA-256 (LF line endings):
+  66d09390da0dc051eb7901b41beda67dea415b1afed20df3859c6e7028f40e83
 #>
 [CmdletBinding()]
 param(
@@ -116,8 +118,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ToolVersion = '1.3.0'
-$EngineSha256 = 'ec8537fcd1a52f33661520f4d13ff95714fb5e8b2561239eb3c3e889556cad8d'
+$ToolVersion = '1.3.1'
+$EngineSha256 = '66d09390da0dc051eb7901b41beda67dea415b1afed20df3859c6e7028f40e83'
 $PythonVersion = '3.13.16'
 $Packages = @('dissect==3.22', 'tabulate==0.10.0', 'XlsxWriter==3.2.9', 'python-docx==1.2.0')
 $PackageCheck = 'dissect=3.22;tabulate=0.10.0;XlsxWriter=3.2.9;python-docx=1.2.0'
@@ -288,7 +290,7 @@ import traceback
 import urllib.parse
 from pathlib import Path
 
-ENGINE_VERSION = "1.3.0"
+ENGINE_VERSION = "1.3.1"
 UTC = dt.timezone.utc
 XL_MAX_ROWS = 1048575      # data rows per sheet (one header row on top)
 XL_MAX_CELL = 32000        # Excel allows 32,767 characters per cell
@@ -320,11 +322,11 @@ CASE_IOC_IPS = [
 # 2) Public reporting on NetScaler exploitation up to REPORTED_AS_OF: Rapid7, Zscaler, watchTowr, Unit 42, LevelBlue,
 #    eSentire, Mandiant, GreyNoise, Arctic Wolf, Sygnia, Truesec, Beazley, TENEX, SOCRadar, Lupovis, Corelight, IFIN, and
 #    the Poppelgaard checker (which relays Gotham Technology Group IR and Huntback.io decoy data). Only C2, payload,
-#    staging and exfiltration servers (reported-infra) and webshell users and exploit sources named by vendor or IR
-#    reports (reported-exploit) are included; mass-scan feeds and Tor exits are left out, and so are Cloudflare WARP
-#    addresses except the four that Unit 42 tied to this actor's webshell and GetUserName requests (ordinary WARP
-#    users share those too, so a hit on one of them is weak on its own).
-#    One line per IP: ip | level | what it was seen doing (sources).
+#    staging and exfiltration servers (reported-infra), webshell users and exploit sources named by vendor or IR
+#    reports (reported-exploit), and IPs in a vendor's IOC table with no stated role (reported-ioc) are included;
+#    mass-scan feeds and Tor exits are left out, and so are Cloudflare WARP addresses except the four that Unit 42 tied
+#    to this actor's webshell and GetUserName requests (ordinary WARP users share those too, so a hit on one of them
+#    is weak on its own). One line per IP: ip | level | what it was seen doing (sources).
 REPORTED_AS_OF = "2026-10-19"
 _REPORTED_IOC_IPS = """
 38.180.81.157 | reported-infra | Platypus C2 node sharing the cluster's TLS certificate (TENEX, Poppelgaard checker)
@@ -506,6 +508,9 @@ _REPORTED_IOC_IPS = """
 167.88.172.6 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
 194.127.166.126 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
 207.148.105.57 | reported-exploit | in a Gotham Technology Group IR group (2 Oct) whose members did recon, webshell polling, payload or callback work (Poppelgaard checker)
+45.61.136.143 | reported-ioc | in Unit 42's network IOC table with no stated role; BL Networks, the provider of several other reported IPs (Unit 42, Poppelgaard checker)
+66.227.183.84 | reported-ioc | in Unit 42's network IOC table with no stated role; Charter Communications network (Unit 42, Poppelgaard checker)
+216.245.184.164 | reported-ioc | in Unit 42's network IOC table with no stated role; BL Networks, the provider of several other reported IPs (Unit 42, Poppelgaard checker)
 """
 REPORTED_IOC_IPS = [tuple(x.strip() for x in line.split("|", 2)) for line in _REPORTED_IOC_IPS.strip().splitlines()]
 BUILTIN_IOC_IPS = CASE_IOC_IPS + [x for x in REPORTED_IOC_IPS if x[0] not in {c[0] for c in CASE_IOC_IPS}]
@@ -583,10 +588,12 @@ CLIENT_IP_RX = re.compile(r"Client_?ip[:\s]+([0-9A-Fa-f.:]{3,})|@(\d{1,3}(?:\.\d
 # run with upper case, lower case and digits. Only the User-Agent field is examined.
 UA_PAYLOAD_RX = re.compile(r"(?P<mark>INDEX:|\bK:)(?P<pre>[A-Za-z0-9+/=]{16,})|(?P<run>[A-Za-z0-9+/]{60,}={0,2})"
                            r"|(?P<php>PD9waHA[A-Za-z0-9+/]*={0,2})")
-# SHA-256 of payloads published by Unit 42 (2026-09-30): the base64 text and the shell script it decodes to.
-KNOWN_PAYLOAD_SHA256 = {
+# SHA-256 published by Unit 42 (2026-09-30): the stage 1 base64 text, the shell script it decodes to, and the nsg64.deb
+# web shell. Staged User-Agent payloads (B2) and files in the web, client download and temp folders are compared.
+KNOWN_SHA256 = {
     "1bd314b661396c7086f6367fbbb48025e03ca2de69c073d53a8b0a38aa5fbb7d": "Unit 42 published hash (base64 payload)",
     "79c65fa04541032e251fa4796b97800374b63c7982593dd1a2e0db605d429186": "Unit 42 published hash (decoded shell script)",
+    "ae22ef2517b5c0fb47f78745b9cb5260acee0e751b89bcd354640ff8bc8d29ec": "Unit 42 published hash (nsg64.deb web shell)",
 }
 
 
@@ -621,6 +628,27 @@ def user_agent(text):
     return s[i + 1:j] if i >= 0 else ""
 
 
+B64_TOKEN_RX = re.compile(r"[A-Za-z0-9+/]{8,}={0,2}")
+CMDISH_RX = re.compile(r"://|<\?php|/bin/|/tmp/|\b(?:curl|wget|fetch|bash|php|perl|python[23]?|echo|chmod|base64|whoami|"
+                       r"uname|mkdir|nohup|busybox|tftp|cat|tar)\b|(?:^|[|;&]\s*)(?:sh|id|ls)\b")
+
+
+def readable_b64(tok):
+    """True when a whole token is base64 (8+ characters) that decodes to readable ASCII text with a command, URL or
+    PHP code in it. Ordinary user-agent words almost never decode to printable ASCII, let alone to a command."""
+    if not B64_TOKEN_RX.fullmatch(tok):
+        return False
+    raw = decode_b64(tok)
+    if len(raw) < 6:
+        return False
+    try:
+        txt = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    good = sum(1 for ch in txt if " " <= ch <= "~" or ch in "\r\n\t")
+    return good / len(txt) >= 0.95 and bool(CMDISH_RX.search(txt))
+
+
 def ua_payload(ua):
     """(marker, base64 text) of a payload staged in a User-Agent, or None."""
     for m in UA_PAYLOAD_RX.finditer(ua):
@@ -631,6 +659,9 @@ def ua_payload(ua):
         run = m.group("run")
         if re.search(r"[A-Z]", run) and re.search(r"[a-z]", run) and re.search(r"\d", run):
             return "long base64 run", run
+    for tok in ua.split():     # short payloads: a whole word of the User-Agent that decodes to a readable command
+        if readable_b64(tok):
+            return "base64 word that decodes to text", tok
     return None
 
 
@@ -639,10 +670,13 @@ class UaPayloadMatcher:
 
     def search(self, text):
         ua = user_agent(text)
-        if len(ua) < 16:
+        if len(ua) < 8:
             return None
-        # quick exit for ordinary agents: no marker and no whitespace-free stretch long enough to hold a 60-char run
-        if "INDEX:" not in ua and "K:" not in ua and "PD9waHA" not in ua and not any(len(w) >= 60 for w in ua.split()):
+        # quick exit for ordinary agents: no marker, no stretch long enough for a 60-character run, and no word made
+        # only of base64 characters
+        words = ua.split()
+        if "INDEX:" not in ua and "K:" not in ua and "PD9waHA" not in ua and not any(len(w) >= 60 for w in words) \
+                and not any(len(w) >= 8 and "." not in w and B64_TOKEN_RX.fullmatch(w) for w in words):
             return None
         return ua_payload(ua)
 
@@ -668,8 +702,8 @@ def payload_kind(raw):
     good = sum(1 for ch in txt if ch.isprintable() or ch in "\r\n\t")
     if good / len(txt) < 0.85:
         return f"binary ({len(raw)} bytes)"
-    if txt.startswith("#!") or re.search(r"\b(curl|wget|fetch|sh|bash|echo|chmod|mkdir|base64|perl|python3?|php|tar|nc)\b",
-                                         txt):
+    if txt.startswith("#!") or re.search(r"\b(curl|wget|fetch|sh|bash|echo|chmod|mkdir|base64|perl|python3?|php|tar|nc|"
+                                         r"uname|whoami|id|cat|ls|ps)\b", txt):
         return "shell commands"
     return "text"
 
@@ -726,6 +760,20 @@ WEB_NOISE_RX = re.compile(r"^/var/(run|netscaler/gui|netscaler/nitro|vpn/themes|
 CLIENT_PKG_DIR_RX = re.compile(r"^/var/netscaler/gui/(vpn|epa)/scripts/linux/[^/]+$")
 UNIT42_PKG_NAMES = {"nsgclient18.deb", "nsgser18.deb", "nsgsupport.deb", "nsgpackage64.deb", "nsgbuild.deb", "nsg64.deb"}
 PKG_MAGIC = {".deb": b"!<arch>\n", ".rpm": b"\xed\xab\xee\xdb"}
+# Web-served folders on /var. Fox-IT only inspects *.php files there; this actor hid PHP web shells in other files
+# (.ctxs.receiver, package-named .deb files) and reached them through aliases. In the GUI tree, which holds the stock
+# PHP application, only static file types, extension-less files and hidden files are read; elsewhere every non-PHP file.
+WEB_ROOT_RX = re.compile(r"^/var/(netscaler/logon|netscaler/gui|netscaler/ns_gui|vpn)/")
+GUI_ROOT_RX = re.compile(r"^/var/netscaler/(gui|ns_gui)/")
+PHP_EXTS = {".php", ".php3", ".php4", ".php5", ".php7", ".phtml", ".phps", ".inc", ".tpl"}
+STATIC_EXTS = {".css", ".js", ".map", ".json", ".xml", ".txt", ".png", ".gif", ".jpg", ".jpeg", ".ico", ".svg", ".woff",
+               ".woff2", ".ttf", ".eot", ".deb", ".rpm", ".gz", ".zip", ".receiver", ".min"}
+PHP_CODE_RX = re.compile(rb"<\?php|<\?=\s*\$", re.I)
+# Files hashed and compared with KNOWN_SHA256: web folders outside the GUI tree, the client download folders, the
+# temp folders, and any file another check flagged. Larger files are skipped (the published files are small).
+HASH_SCOPE_RX = re.compile(r"^/var/(netscaler/logon|vpn|tmp|nstmp)/|^/var/netscaler/(gui|ns_gui)/(vpn|epa)/scripts/linux/")
+HASH_MAX_BYTES = 20 << 20
+LOGON_DROP_DIR = "/var/netscaler/logon/LogonPoint/custom"
 WALK_SKIP_WINDOW = ("/var/log/", "/var/nslog/", "/var/nstrace/", "/var/core/", "/var/crash/", "/var/netscaler/locdb/",
                     "/var/mastools/logs/")
 
@@ -1432,7 +1480,13 @@ def check_known_iocs(t):
     return rows
 
 
-HOOK_FILES_GLOB = [("/flash/nsconfig", r"^(rc\.netscaler.*|nsafter\.sh|nsbefore\.sh)$"), ("/var/cron/tabs", r".*")]
+# Boot scripts and crontabs. /flash/nsconfig/crontab is the persistent copy of /etc/crontab: Citrix (CTX327915) has
+# administrators copy a customized /etc file into /nsconfig, and the appliance links it back into /etc at boot.
+HOOK_FILES_GLOB = [("/flash/nsconfig", r"^(rc\.netscaler.*|nsafter\.sh|nsbefore\.sh|crontab)$"), ("/var/cron/tabs", r".*")]
+SETUID_RX = re.compile(r"\bchmod\s+(?:-[A-Za-z]+\s+)*(?:[ugoa]*[+=][rwxXt]*s|0?[2-7][0-7]{3}\b)")
+HTTPD_RELOAD_RX = re.compile(r"httpd\.pid|apachectl|\bhttpd\s+-k\b|kill\s+-(?:HUP|1|USR1)\b[^|;&]*httpd", re.I)
+HTTPD_EDIT_RX = re.compile(r"\b(?:perl|sed|awk|ed|ex|tee|echo|printf)\b|>>?", re.I)
+PHP_ENGINE_ON_RX = re.compile(r"php_(?:admin_)?flag\s+engine\s+on\b", re.I)
 
 
 def check_hooks(t, since="", until=""):
@@ -1498,9 +1552,136 @@ def check_hooks(t, since="", until=""):
                         flags.append("contains an IP address")
                     if x_rx.search(s):
                         flags.append("names a known implant file or string")
+                    if "httpd.conf" in s and HTTPD_EDIT_RX.search(s):
+                        flags.append("edits the web server config (httpd.conf)")
+                    if PHP_ENGINE_ON_RX.search(s):
+                        flags.append("turns the PHP engine on")
+                    if HTTPD_RELOAD_RX.search(s):
+                        flags.append("reloads or restarts the web server")
+                    if SETUID_RX.search(s):
+                        flags.append("sets a setuid or setgid bit")
                 rows.append({"file": str(e), "line": i, "text": line, "flags": "; ".join(flags),
                              "mtime": meta["mtime"], "btime": meta["btime"], "sha256": meta["sha256"],
                              "installed": installed})
+    return rows
+
+
+HTTPD_CONF_COPIES = ["/flash/nsconfig/httpd.conf"]   # persistent copy of /etc/httpd.conf, linked into /etc at boot
+_BLOCK_OPEN_RX = re.compile(r"^<\s*(Directory|DirectoryMatch|Location|LocationMatch|Files|FilesMatch)\b\s*(.*?)\s*>$", re.I)
+_BLOCK_CLOSE_RX = re.compile(r"^</\s*(Directory|DirectoryMatch|Location|LocationMatch|Files|FilesMatch)\s*>$", re.I)
+_PHP_TYPE_RX = re.compile(r"^(AddType|AddHandler)\s+\S*php\S*\s+(.+)$", re.I)
+_PHP_FORCE_RX = re.compile(r"^(ForceType|SetHandler)\s+\S*php", re.I)
+_ALIAS_RX = re.compile(r"^(Alias|AliasMatch|ScriptAlias|ScriptAliasMatch|RewriteRule|Redirect\w*)\s+(.+)$", re.I)
+
+
+def files_block_names_hidden_file(kind, arg):
+    """True for <Files ".name"> or <FilesMatch "^\\.name"> naming a hidden file (not .ht* and not a bare dot rule)."""
+    a = arg.strip()
+    regex = kind.endswith("match") or a.startswith("~")
+    a = a.lstrip("~").strip().strip("\"'")
+    if regex:
+        return bool(re.match(r"\^\\?\.(?!ht)[A-Za-z0-9]", a))
+    return len(a) > 1 and a[0] == "." and a[1].isalnum() and not a.startswith(".ht")
+
+
+def check_httpd_conf(t, since="", until=""):
+    """Persistent httpd.conf copies: a summary row per file plus the lines that match what Unit 42 describes the actor
+    adding (PHP engine switched on, aliases that expose a web shell as receiver.min.css, a Files block that runs a
+    hidden file as PHP). Rows have the same shape as check_hooks rows."""
+    rows = []
+    x_rx = re.compile(IMPLANT_STRINGS, re.I)
+    for path in HTTPD_CONF_COPIES:
+        if not exists(t, path):
+            continue
+        e = t.fs.path(path)
+        meta = entry_row(e)
+        if meta["type"] != "file":
+            continue
+        text = read_image_text(t, path, limit=8 << 20) or ""
+        lines = text.splitlines()
+        has_off = bool(re.search(r"^\s*php_(?:admin_)?flag\s+engine\s+off\b", text, re.I | re.M))
+        stack, found = [], []
+        for i, line in enumerate(lines, 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            flags = []
+            mo = _BLOCK_OPEN_RX.match(s)
+            if mo:
+                stack.append((mo.group(1).lower(), mo.group(2)))
+                if mo.group(1).lower().startswith("files") and files_block_names_hidden_file(mo.group(1).lower(),
+                                                                                             mo.group(2)):
+                    flags.append("Files block for a hidden file (Unit 42: how the actor registered .ctxs.receiver)")
+            elif _BLOCK_CLOSE_RX.match(s):
+                if stack:
+                    stack.pop()
+            context = " ".join(arg for _k, arg in stack)
+            if PHP_ENGINE_ON_RX.search(s):
+                if line != line.rstrip():
+                    flags.append("PHP engine switched on, with the trailing space the actor's one-line edit leaves "
+                                 "(Unit 42)")
+                elif not has_off:
+                    flags.append("PHP engine switched on and no 'engine off' line left (NetScaler ships with it off; "
+                                 "Unit 42)")
+                elif re.search(r"logon|LogonPoint|custom", context, re.I):
+                    flags.append("PHP engine switched on for the Gateway logon folder")
+            ma = _ALIAS_RX.match(s)
+            if ma:
+                args = ma.group(2)
+                target = args.split()[-1].strip("\"'")
+                if re.search(r"receiver\.min|\.receiver\b", args, re.I) or re.search(r"/\.(?!ht|well-known)[A-Za-z0-9]",
+                                                                                      target) \
+                        or re.search(r"(?:^|\s)\"?/(?:var/)?tmp/", args):
+                    flags.append("alias to a hidden file or a disguised web shell name (Unit 42: receiver.min.css and "
+                                 "receiver.min.<hex>.css aliases)")
+            mt_ = _PHP_TYPE_RX.match(s)
+            if mt_:
+                exts = [x for x in mt_.group(2).split() if x.startswith(".")]
+                odd = [x for x in exts if x.lower() not in PHP_EXTS]
+                if odd:
+                    flags.append("runs PHP for non-PHP file types: " + " ".join(odd))
+            if _PHP_FORCE_RX.match(s) and stack and "php" not in context.lower():
+                flags.append(f"forces PHP inside <{stack[-1][0]} {stack[-1][1]}>")
+            if x_rx.search(s):
+                flags.append("names a known implant file or string")
+            if flags:
+                found.append({"file": path, "line": i, "text": line, "flags": "; ".join(dict.fromkeys(flags)),
+                              "mtime": meta["mtime"], "btime": meta["btime"], "sha256": meta["sha256"], "installed": ""})
+        changed = []
+        if since and meta["btime"] and since <= meta["btime"] < until:
+            changed.append("file created in the review window")
+        if since and meta["mtime"] and since <= meta["mtime"] < until:
+            changed.append("file modified in the review window")
+        rows.append({"file": path, "line": "", "text": f"(persistent copy of /etc/httpd.conf, used at boot: {len(lines)} "
+                                                       f"lines, {len(found)} flagged; only flagged lines are listed)",
+                     "flags": "; ".join(changed), "mtime": meta["mtime"], "btime": meta["btime"],
+                     "sha256": meta["sha256"], "installed": ""})
+        rows.extend(found)
+    return rows
+
+
+CORE_DIRS = ("/var/core", "/var/crash")
+CORE_SKIP = {"minfree", "bounds", ".snap"}      # FreeBSD bookkeeping files in /var/crash
+
+
+def list_cores(t):
+    """Core and crash dumps on the disk with their times. Unit 42 says the CVE-2026-88772 DTLS exploit causes memory
+    corruption or a crash, and crashing processes (packet engines, nsaaad) can leave cores, so these times are worth
+    lining up with the C and D crash records."""
+    rows = []
+    for top in CORE_DIRS:
+        if not exists(t, top):
+            continue
+        for e, st in walk(t, top, limit=20000):
+            if not stat.S_ISREG(st.st_mode) or e.name in CORE_SKIP:
+                continue
+            low = e.name.lower()
+            kind = ("packet engine (NSPPE) core" if "nsppe" in low
+                    else "kernel crash dump" if re.match(r"(vmcore|info|textdump|core\.txt)(\.|$)", low)
+                    else "process core")
+            rows.append({"path": str(e), "kind": kind, "size": st.st_size, "mtime": ts(st.st_mtime),
+                         "btime": ts(getattr(st, "st_birthtime", None))})
+    rows.sort(key=lambda r: (r["mtime"], r["path"]))
     return rows
 
 
@@ -1512,24 +1693,55 @@ def cron_header_time(text):
     return f"{m.group(4)}-{MONTHS[m.group(1)]:02d}-{int(m.group(2)):02d} {m.group(3)}"
 
 
-def client_pkg_category(e, p, kind):
-    """Discovery category for a file in the VPN / EPA client download folders that needs a look, else None."""
-    if kind != "file" or not CLIENT_PKG_DIR_RX.match(p):
-        return None
-    name = p.rsplit("/", 1)[1]
-    if name.lower() in UNIT42_PKG_NAMES:
-        return "Lead: client download folder: file name Unit 42 reported as a webshell"
-    magic = PKG_MAGIC.get(os.path.splitext(name)[1].lower())
-    if magic is None:
-        return None
+def read_head_bytes(e, n):
     try:
         with e.open("rb") as fh:
-            head = fh.read(len(magic))
+            return fh.read(n)
     except Exception:
-        return "Lead: client download folder: package could not be read"
-    if head != magic:
-        return "Lead: client download folder: not a real package, possibly a disguised webshell"
-    return None
+        return None
+
+
+def sha256_image_file(e):
+    try:
+        h = hashlib.sha256()
+        with e.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def file_checks(e, p, kind, size):
+    """(Discovery category or None, SHA-256 or '') for one file: the VPN / EPA client download folder checks, PHP code
+    hidden in a non-PHP file under a web folder, and the published hashes (KNOWN_SHA256)."""
+    if kind != "file":
+        return None, ""
+    name = p.rsplit("/", 1)[1]
+    ext = os.path.splitext(name)[1].lower()
+    in_pkg = bool(CLIENT_PKG_DIR_RX.match(p))
+    cat = None
+    if in_pkg and name.lower() in UNIT42_PKG_NAMES:
+        cat = "Lead: client download folder: file name Unit 42 reported as a webshell"
+    head = None
+    if WEB_ROOT_RX.match(p) and ext not in PHP_EXTS and (
+            not GUI_ROOT_RX.match(p) or in_pkg or ext in STATIC_EXTS or not ext or name.startswith(".")):
+        head = read_head_bytes(e, 65536)
+        if head is not None and PHP_CODE_RX.search(head):
+            cat = ("Lead: client download folder: PHP code in a package-named file, a disguised web shell" if in_pkg
+                   else "Lead: web folder: PHP code in a non-PHP file (possible web shell)")
+    if cat is None and in_pkg and ext in PKG_MAGIC:
+        head = head if head is not None else read_head_bytes(e, 8)
+        if head is None:
+            cat = "Lead: client download folder: package could not be read"
+        elif not head.startswith(PKG_MAGIC[ext]):
+            cat = "Lead: client download folder: not a real package, possibly a disguised webshell"
+    sha = ""
+    if (cat or HASH_SCOPE_RX.match(p)) and size <= HASH_MAX_BYTES:
+        sha = sha256_image_file(e)
+        if sha in KNOWN_SHA256:
+            cat = f"IOC: SHA-256 matches {KNOWN_SHA256[sha]}"
+    return cat, sha
 
 
 def discovery_walk(t, since, until):
@@ -1545,11 +1757,16 @@ def discovery_walk(t, since, until):
             mt = ts(st.st_mtime)
             hidden = any(x.startswith(".") for x in p.split("/") if x)
             born_in = bool(b) and s <= b < u
-            cat = client_pkg_category(e, p, kind)
-            if cat:
-                pass
+            fcat, sha = file_checks(e, p, kind, st.st_size)
+            cat = None
+            if fcat and fcat.startswith("IOC"):
+                cat = fcat
             elif KNOWN_IOC_RX.search(p):
                 cat = "IOC: known implant artifact"
+            elif fcat:
+                cat = fcat
+            elif p == LOGON_DROP_DIR and kind == "dir" and born_in:
+                cat = "Lead: Gateway logon folder custom/ created in the window (Unit 42: the actor's web shell drop path)"
             elif hidden and BENIGN_HIDDEN_RX.search(p):
                 cat = "Context: standard hidden file"
             elif hidden:
@@ -1568,7 +1785,7 @@ def discovery_walk(t, since, until):
                     cat = "Context: other item created in the window"
             if cat:
                 rows.append({"category": cat, "path": p, "type": kind, "mode": oct(m & 0o7777), "uid": st.st_uid,
-                             "size": st.st_size, "mtime": mt, "ctime": ts(st.st_ctime), "btime": b})
+                             "size": st.st_size, "mtime": mt, "ctime": ts(st.st_ctime), "btime": b, "sha256": sha})
     return rows
 
 
@@ -2019,7 +2236,7 @@ def ua_payload_rows(hunts):
         dec = raw.decode("utf-8", "replace")
         hashes = {hashlib.sha256(b64.encode()).hexdigest(), hashlib.sha256((b64 + "\n").encode()).hexdigest()}
         h_dec = hashlib.sha256(raw).hexdigest() if raw else ""
-        known = sorted({KNOWN_PAYLOAD_SHA256[h] for h in hashes | {h_dec} if h in KNOWN_PAYLOAD_SHA256})
+        known = sorted({KNOWN_SHA256[h] for h in hashes | {h_dec} if h in KNOWN_SHA256})
         req = (m.group("req") or "").split(" ") if m else []
         ip = m.group("ip") if m else ""
         if not ip:
@@ -2063,12 +2280,14 @@ def agent_log_rows(local, mtime_s):
     return out
 
 
-def timeline(label, ioc_rows, hooks, sec_summary, ws_by_ip, hunts, agent_rows, logging_stopped, vmsd, since_s):
+def timeline(label, ioc_rows, hooks, sec_summary, ws_by_ip, hunts, agent_rows, logging_stopped, vmsd, since_s, cores=()):
     ev = []
 
     def add(t_, src, event, detail=""):
         if t_:
             ev.append({"time": t_, "target": label, "source": src, "event": event, "detail": detail})
+    for c_ in cores:
+        add(c_["mtime"], "core dumps", f"{c_['kind']} written: {c_['path']}", f"{c_['size']:,} bytes (file modified time)")
     for r in ioc_rows:
         if r.get("present") and r["type"] in ("file", "dir"):
             add(r["btime"], "file system", f"created {r['path']}", f"{r['type']}, {r['size']} bytes, sha256 {r['sha256'][:16]}")
@@ -2196,7 +2415,8 @@ def hunt_image(cand, img_path, label, out_root, args, run):
 
     say(f"[{label}] checking known IOC paths, boot and cron hooks")
     res["ioc"] = check_known_iocs(t)
-    res["hooks"] = check_hooks(t, ts(since), ts(until))
+    res["hooks"] = check_hooks(t, ts(since), ts(until)) + check_httpd_conf(t, ts(since), ts(until))
+    res["cores"] = list_cores(t)
     base_presence = {}
     if cand and cand["base"] != img_path:
         try:
@@ -2268,7 +2488,7 @@ def hunt_image(cand, img_path, label, out_root, args, run):
 
     vmsd = cand["vmsd"] if cand else []
     res["timeline"] = timeline(label, res["ioc"], res["hooks"], res["sections"], res["webshell_by_ip"], hunts,
-                               res["agent"], logging_stopped, vmsd, ts(since))
+                               res["agent"], logging_stopped, vmsd, ts(since), res["cores"])
     res["network"] = network_iocs(res, args)
     say(f"[{label}] writing the results workbook")
     res["workbook"] = str(tdir / f"{label}_Hunt_Results.xlsx")
@@ -2388,9 +2608,16 @@ def write_workbook(res, path, args):
         f"Review window: {res['since']} to {res['until']} (used by the Discovery sheet).",
         "Sheets: Summary, Target, Disk_Chain, IOC_Files (known implant paths with SHA-256), Hooks (boot script and "
         "crontab lines), Discovery (hidden, implant-like and new items), A to I (log hunt hits), Hunt_Summary, "
-        "I_Shell_Distinct, Webshell_by_IP, Pitboss_Injections, Network_IOCs, Agent_Log (tunnel log), Logins_utx, "
-        "Shell_Audit_Rare, Log_Integrity_NUL, Implant_Strings_by_File, FoxIT_iocitrix, Timeline, Log_Inventory, "
-        "Export_Manifest.",
+        "I_Shell_Distinct, Webshell_by_IP, Pitboss_Injections, Network_IOCs, Core_Dumps, Agent_Log (tunnel log), "
+        "Logins_utx, Shell_Audit_Rare, Log_Integrity_NUL, Implant_Strings_by_File, FoxIT_iocitrix, Timeline, "
+        "Log_Inventory, Export_Manifest.",
+        "Web shells hidden in other files: Discovery reads the web folders (/var/netscaler/logon, /var/vpn, and static "
+        "file types in /var/netscaler/gui) for PHP code in files that are not .php, checks the VPN / EPA client download "
+        "folders for package-named files that are not real packages, and compares files in the web, download and temp "
+        "folders with the SHA-256 values Unit 42 published.",
+        "Persistence: /flash/nsconfig/httpd.conf and /flash/nsconfig/crontab are the persistent copies of /etc/httpd.conf "
+        "and /etc/crontab (linked back into /etc at boot). Hooks lists the httpd.conf lines that switch the PHP engine "
+        "on, alias a hidden file or a receiver.min.css name, or run a hidden file as PHP, and every crontab line.",
         "PITBOSS log poisoning (CVE-2026-88771): B lists forged pitboss / NSPPE records in any top-level /var/log file "
         "(a login user name that imitates a pitboss crash record, usually with a command after NSPPE); A lists Call Home "
         "crash checker lines (callhomedebug.log) that carry such a command, the step that runs it; B2 lists web requests "
@@ -2404,7 +2631,8 @@ def write_workbook(res, path, args):
         "Hunt H searches every log for the built-in attacker IPs (the intrusion this tool was built on, plus public "
         f"reporting up to {REPORTED_AS_OF}) and any given with -IocIp. Level: confirmed, likely or suspected (may be a "
         "scanner) for the tool's own case; reported-infra (publicly reported C2, payload, staging or exfiltration "
-        "server); reported-exploit (publicly reported exploit source or webshell user); supplied (-IocIp). A hit is a "
+        "server); reported-exploit (publicly reported exploit source or webshell user); reported-ioc (in a vendor's IOC "
+        "table with no stated role); supplied (-IocIp). A hit is a "
         "lead: read the log line before calling it attacker activity.",
         "Syslog lines carry no year or zone: the year comes from the file's modified time. " + res.get("clock_note", ""),
         "agent.log lines carry only HH:MM:SS: dates are inferred backwards from the file's modified time; days with no "
@@ -2427,6 +2655,10 @@ def write_workbook(res, path, args):
     summ += [["Distinct PITBOSS injected commands (A and B)",
               sum(1 for n in res["nsppe"] if n["injected"] != NO_COMMAND)],
              ["Staged User-Agent payloads (B2)", len(res["ua_payloads"])],
+             ["Files matching a published SHA-256", sum(1 for d in res["discovery"]
+                                                       if d["category"].startswith("IOC: SHA-256"))],
+             ["Web files with PHP code that are not .php", sum(1 for d in res["discovery"] if "PHP code" in d["category"])],
+             ["Core and crash dumps", len(res["cores"])],
              ["Tunnel opens in agent.log", sum(1 for r in res["agent"] if r["kind"] == "open")],
              ["Logs with NUL-byte runs", len({x[0] for x in h.nul})],
              ["Fox-IT iocitrix findings", "not run" if res["foxit"] is None else len(res["foxit"])],
@@ -2471,10 +2703,11 @@ def write_workbook(res, path, args):
             [34, 6, 70, 60, 20, 20, 66])
     order = {"IOC": 0, "Lea": 1, "Con": 2}
     b.table("Discovery", ["Category", "Path", "Type", "Mode", "UID", "Size", "Modified (UTC)", "Changed (UTC)",
-                          "Created (UTC)"],
-            ([d["category"], d["path"], d["type"], d["mode"], d["uid"], d["size"], d["mtime"], d["ctime"], d["btime"]]
+                          "Created (UTC)", "SHA-256 (web, download and temp folders)"],
+            ([d["category"], d["path"], d["type"], d["mode"], d["uid"], d["size"], d["mtime"], d["ctime"], d["btime"],
+              d.get("sha256", "")]
              for d in sorted(res["discovery"], key=lambda d: (order.get(d["category"][:3], 9), d["category"], d["path"]))),
-            [50, 80, 8, 8, 6, 12, 20, 20, 20])
+            [50, 80, 8, 8, 6, 12, 20, 20, 20, 66])
     for key, sheet, title, pats, _rx in h.sections:
         rows = h.hits[key]
         if key == "E":
@@ -2515,6 +2748,8 @@ def write_workbook(res, path, args):
     b.table("Network_IOCs", ["Indicator", "Type", "Role", "Seen in", "Count", "First (UTC)", "Last (UTC)", "Detail"],
             ([n["indicator"], n["type"], n["role"], n["where"], n["count"], n["first"], n["last"], n["detail"]]
              for n in res["network"]), [40, 8, 44, 60, 8, 20, 20, 50])
+    b.table("Core_Dumps", ["Kind", "Path in image", "Size", "Modified (UTC)", "Created (UTC)"],
+            ([c_["kind"], c_["path"], c_["size"], c_["mtime"], c_["btime"]] for c_ in res["cores"]), [28, 70, 14, 20, 20])
     b.table("Agent_Log", ["Date (inferred)", "Time", "Kind", "Destination IP", "Port", "Session", "Message"],
             ([r["date"], r["time"], r["kind"], r["dest_ip"], r["dest_port"], r["sid"], r["message"]] for r in res["agent"]),
             [14, 10, 12, 16, 8, 8, 90])
@@ -2644,7 +2879,7 @@ def write_docx(path, run, results):
          f"the intrusion this tool was built on, {len(iocs.get('built_in', [])) - len(CASE_IOC_IPS)} from public reporting "
          f"up to {REPORTED_AS_OF})" + (f" and {len(sup)} supplied with -IocIp ({sup_txt})" if sup else "")
          + ". The H_Attacker_IP_Lines sheet gives each IP's level (confirmed, likely, suspected, reported-infra, "
-         "reported-exploit or supplied) and what it was seen doing.", italic=True)
+         "reported-exploit, reported-ioc or supplied) and what it was seen doing.", italic=True)
 
     hashes = collections.defaultdict(set)
     for r in results:
@@ -2749,6 +2984,13 @@ def write_docx(path, run, results):
             bullet(f"{secs.get('D', {}).get('count', 0)} genuine packet engine (NSPPE) crash record(s) from pitboss and "
                    f"{secs.get('C', {}).get('count', 0)} nsaaad crash, restart-limit or pitboss reboot line(s); forged "
                    f"pitboss records are not counted here. (C, D)")
+        cores = r.get("cores", [])
+        if cores:
+            ppe = sum(1 for c_ in cores if c_["kind"].startswith("packet engine"))
+            inwin = sum(1 for c_ in cores if c_["mtime"] and c_["mtime"] >= r["since"])
+            bullet(f"{len(cores)} core or crash dump(s) on disk ({ppe} from a packet engine), {inwin} written in the review "
+                   f"window, newest {cores[-1]['mtime'] or 'unknown'}. Unit 42 says the CVE-2026-88772 DTLS exploit causes "
+                   f"memory corruption or a crash, so line these up with the C and D records. (Core_Dumps)")
         if secs.get("F", {}).get("count"):
             found_any = True
             bullet(f"{secs['F']['count']} .relay installer line(s) in the shell audit log, {secs['F']['first']} to "
@@ -2779,15 +3021,32 @@ def write_docx(path, run, results):
                    + (": " + ", ".join(f"{k} {v}" for k, v in types.most_common()) if types else "")
                    + ". file/timestomp hits are often caused by upgrades. (FoxIT_iocitrix)")
         leads = [d for d in r["discovery"] if d["category"].startswith("Lead")]
+        hash_hits = [d for d in r["discovery"] if d["category"].startswith("IOC: SHA-256")]
+        if hash_hits:
+            found_any = True
+            bullet("Files matching a published hash: " + "; ".join(
+                f"{d['path']} ({d['category'][len('IOC: SHA-256 matches '):]})" for d in hash_hits[:10]) + ". (Discovery)")
         pkg = [d for d in leads if "client download folder" in d["category"]]
         if pkg:
             found_any = True
             bullet("VPN / EPA client download folder: " + "; ".join(f"{d['path']} ({d['category'].split(': ', 2)[-1]})"
                                                                   for d in pkg[:10])
                    + ". Unit 42 reported the actor hosting webshells there under package names. (Discovery)")
+        webphp = [d for d in leads if d["category"].startswith("Lead: web folder: PHP code")]
+        if webphp:
+            found_any = True
+            bullet("PHP code inside non-PHP files in the web folders (how this actor hid its web shells, reached through "
+                   "aliases such as receiver.min.css): " + ", ".join(d["path"] for d in webphp[:10])
+                   + (f" and {len(webphp) - 10} more" if len(webphp) > 10 else "") + ". (Discovery)")
+        drop = [d for d in leads if d["path"] == LOGON_DROP_DIR]
+        if drop:
+            found_any = True
+            bullet(f"{LOGON_DROP_DIR} was created in the review window ({drop[0]['btime']}); Unit 42 reports the actor "
+                   f"creating it as the drop folder for its web shell. (Discovery)")
         if leads:
             bullet(f"{len(leads)} item(s) on disk to review (hidden, new in /flash, /var/tmp or /var/nstmp, written by the "
-                   f"web server in the window, or a suspect file in the VPN / EPA client download folders). (Discovery)")
+                   f"web server in the window, PHP code in a non-PHP web file, or a suspect file in the VPN / EPA client "
+                   f"download folders). (Discovery)")
         if not found_any:
             bullet("None of the known implant paths, hooks or log indicators were found in this image.")
 
@@ -2861,11 +3120,19 @@ def write_docx(path, run, results):
             doc.add_heading("Log integrity: NUL-byte runs", 2)
             table(["File", "Line", "NUL bytes", "Last time before", "First time after"], (list(x) for x in h.nul[:40]),
                   [2.6, 0.6, 1.0, 1.6, 1.6])
-        if leads:
+        if leads or hash_hits:
             doc.add_heading("Items on disk to review", 2)
             table(["Category", "Path", "Size", "UID", "Created (UTC)", "Modified (UTC)"],
-                  ([d["category"], d["path"], d["size"], d["uid"], d["btime"], d["mtime"]] for d in leads[:60]),
+                  ([d["category"], d["path"], d["size"], d["uid"], d["btime"], d["mtime"]] for d in (hash_hits + leads)[:60]),
                   [2.4, 3.6, 0.7, 0.5, 1.3, 1.3])
+        cores = r.get("cores", [])
+        if cores:
+            doc.add_heading("Core and crash dumps", 2)
+            para("Process, packet engine and kernel dumps found on the disk. They are not findings by themselves; line "
+                 "their times up with the C and D crash records. (Core_Dumps)", italic=True)
+            table(["Kind", "Path", "Size", "Modified (UTC)", "Created (UTC)"],
+                  ([c_["kind"], c_["path"], f"{c_['size']:,}", c_["mtime"], c_["btime"]] for c_ in cores[-40:]),
+                  [1.8, 3.8, 0.9, 1.3, 1.3])
         if r["foxit"]:
             doc.add_heading("Fox-IT iocitrix findings (excluding file/timestomp)", 2)
             nts = [f for f in r["foxit"] if f["type"] != "file/timestomp"]
