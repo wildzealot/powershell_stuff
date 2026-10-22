@@ -1,6 +1,6 @@
 # NetScaler Hunt (Invoke-NetScalerHunt.ps1)
 
-Version 1.2.0
+Version 1.3.0
 
 One PowerShell script for Windows that hunts Citrix NetScaler (ADC / Gateway) disk images for signs of compromise.
 Point it at a folder of images, or at one image file. It installs what it needs, opens every image read-only,
@@ -79,13 +79,35 @@ Every run checks every image for all of the following. Nothing has to be configu
 
 **Generic signs of NetScaler compromise**
 
-- A, B: commands injected through log poisoning (user names containing `NSPPE;`, the CVE-2026-88771 pattern) and
-  their execution by the call-home crash checker, with the URLs, domains and IPs inside each injected command.
-- C, D: nsaaad crash loops, pitboss reboots and packet engine (NSPPE) crashes.
-- Boot script (`rc.netscaler*`, `nsbefore.sh`, `nsafter.sh`) and crontab lines, flagged when they run something from
-  a hidden folder or /tmp, start a background process, use network or encoding tools, or contain an IP address.
+- PITBOSS log poisoning (CVE-2026-88771), all three stages:
+  - B: forged pitboss records in any top-level `/var/log` file. The attacker logs in with a user name that imitates
+    a pitboss crash record, such as `pitboss PPE missed too many heartbeatsNSPPE;<command>` or
+    `pitboss PPE unexpectedly died NSPPE-00;<command>;# X`. Found with `NSPPE` or `NSPPE-00` followed by `;`, a pipe,
+    backticks, `$(`, `${IFS}` or their URL-encoded forms; with command substitution near the pitboss text; and any
+    pitboss text inside a logged user name (ns.log `LOGIN_FAILED`, `LOGIN REQ`, `AAAD API` and
+    `Authentication delegated` lines, SSL VPN `Context`, sshd `Invalid user`), even without a command. Shell
+    history and audit logs, CLI command records (`CMD_EXECUTED`) and lines that quote the pattern as a regular
+    expression (`pitboss.*`) are left out, because responders' own grep commands quote the same text.
+  - A: Call Home crash checker lines (`callhomedebug.log`) that carry an injected command. On an unpatched appliance
+    the checker (`/netscaler/ns_monuploadd_err.pl`) runs the text after NSPPE.
+  - B2: web requests whose User-Agent holds a base64 payload, the stage 1 step that the injected command fetches
+    from the access log and runs (`INDEX:` and `K:` markers, base64 of `<?php`, or any long base64 run). The B2
+    sheet gives what each payload decodes to (shell commands, PHP code, text or binary), its SHA-256 (checked
+    against Unit 42's published hashes) and the URLs and IPs inside it. The decoded content is never written out.
+  - Pitboss_Injections groups A and B by injected command (URL-decoded), with the client IPs of the forged logins
+    and the URLs, domains and IPs inside each command.
+- C, D: genuine pitboss records: nsaaad crash loops, restart limits and reboots, and packet engine (NSPPE) crashes.
+  Forged records are kept out of C and D.
+- Boot script (`rc.netscaler*`, `nsbefore.sh`, `nsafter.sh`) and crontab lines. These files are normal on a
+  NetScaler (administrators put settings such as `nsapimgr_wr.sh` tuning in `rc.netscaler`), so a line is a finding
+  only when it is flagged: it runs something from a hidden folder or /tmp, starts a background process, uses
+  network or encoding tools, contains an IP address or names a known implant file. A file created or modified in
+  the review window, and a crontab whose header says it was installed in the window, are flagged too. The Word
+  summary shows only flagged lines; every line is on the Hooks sheet.
 - A sweep of `/flash` and `/var` for hidden items, implant-like names and files created in the review window
-  (Discovery sheet).
+  (Discovery sheet). Files in the VPN and EPA client download folders (`/var/netscaler/gui/vpn/scripts/linux/`,
+  `/var/netscaler/gui/epa/scripts/linux/`) are checked as well: a `.deb` or `.rpm` that is not a real package, and
+  the package names Unit 42 reported as this actor's webshells, are leads.
 - I: suspicious shell history (curl, fetch, ssh, scp, tar, crontab, truncation, deletes, and more), with a view of
   each distinct command, rarest first; rare commands in the shell audit log.
 - Logins from `utx.log*`, log files containing runs of NUL bytes (often a sign of truncation), and Fox-IT
@@ -94,7 +116,7 @@ Every run checks every image for all of the following. Nothing has to be configu
 **Known indicators** from the intrusion this tool was built on (October 2026: CVE-2026-88771 log poisoning, then a
 webshell, tunnels and configuration theft) and from public reporting up to 2026-10-19
 
-- 21 known implant and persistence paths, with SHA-256 and times, and whether each is also on the base
+- 19 known implant and persistence paths, with SHA-256 and times, and whether each is also on the base
   (pre-snapshot) disk: the hidden folders `/flash/nsconfig/.slap`, `/flash/nsconfig/.relay` and `/var/tmp/.ux`
   (which held `slapshot.py` and `whipd.py`), the logs `/var/tmp/.s2loot.log`, `.relay-ssh.log`, `.relay-socks.log`
   and `.slap-*`, the webshell copies `.ctxs.receiver`, `.slap.receiver` and `receiver.deb` under
@@ -102,9 +124,14 @@ webshell, tunnels and configuration theft) and from public reporting up to 2026-
   2026-10-19 report on the same implant: the nsvmd Go proxy folder `/flash/.nsvm/` (its `.agent.log` and `.wd.log`
   are exported) and the loot folder `/var/tmp/.s2loot/`; Rapid7 also lists `reverse-agent.sh`, `vcscan-agent.sh` and
   `vc` inside `.slap`, and `run.sh` and `target_agent.py` inside `.relay` (everything inside those folders is listed
-  and hashed).
-- E, E2: requests to those webshell paths and to other probe paths; F: `.relay` installer lines; G: cron runs of
-  the implant; the implant's tunnel log (`agent.log`) and the destinations it reached.
+  and hashed). `rc.netscaler` and root's crontab are not on this list: their presence is normal, so only their
+  flagged lines count (see the boot script and crontab hunt above).
+- E, E2: requests to those webshell paths and to other probe paths, including two from Unit 42's report:
+  `/logon/LogonPoint/Authentication/GetUserName` (Unit 42 considers any request to it anomalous) and the
+  package-named webshells `nsgclient18.deb`, `nsgser18.deb`, `nsgsupport.deb`, `nsgpackage64.deb`, `nsgbuild.deb`
+  and `nsg64.deb` under `/vpn/scripts/linux/` (the real Ubuntu client is `nsgclient18_64.deb` and is not matched);
+  F: `.relay` installer lines; G: cron runs of the implant; the implant's tunnel log (`agent.log`) and the
+  destinations it reached.
 - H: every log line that mentions one of 189 built-in attacker IPs, and `-IocIp` adds more. The 10 IPs from the
   intrusion this tool was built on:
 
@@ -135,8 +162,12 @@ data). They have two levels:
 | `reported-infra` | 38 | C2, payload, staging or exfiltration servers. A NetScaler or internal host talking to one of these is a strong lead. Includes Rapid7's infrastructure for this same implant: 192.159.99.139 (.slap C2, relay and loot upload), 45.92.1.17 (stage and loot server), 209.74.64.192 (nsvmd C2) and 179.60.146.241 (served 1.sh). |
 | `reported-exploit` | 141 | Exploit sources and webshell users named by vendor or incident-response reports, such as watchTowr's and Zscaler's source IPs and Unit 42's webshell users. Many are VPN, cloud or home addresses, so a hit shows targeting, not compromise. |
 
-Mass-scan feeds, Tor exit relays and Cloudflare WARP addresses are left out because ordinary users share them. Every
-hit is a lead: read the log line before you call it attacker activity. The H sheet shows each IP's level and what it
+Mass-scan feeds, Tor exit relays and Cloudflare WARP addresses are left out because ordinary users share them, except
+the four WARP addresses Unit 42 tied to this actor's webshell and GetUserName requests (104.28.215.136,
+104.28.215.137, 104.28.247.136, 104.28.247.137), which are in as `reported-exploit`; a hit on one of those is weak on
+its own. Three IPs in Unit 42's indicator table with no stated role (45.61.136.143, 66.227.183.84,
+216.245.184.164) are not built in; add them with `-IocIp` if you want them searched. Every hit is a lead: read the
+log line before you call it attacker activity. The H sheet shows each IP's level and what it
 was seen doing, with its sources (`supplied` for IPs given with `-IocIp`). To change the lists, edit
 `CASE_IOC_IPS` or the `_REPORTED_IOC_IPS` block in `src/nshunt_engine.py` and rebuild (see "Building from source").
 
@@ -275,10 +306,46 @@ files plain ASCII: Windows PowerShell 5.1 reads a file without a byte order mark
   `reported-infra` and `reported-exploit` levels, both new paths were flagged and the nsvmd logs were exported.
   With 189 IPs, matching 300,000 log lines took 1.7 seconds (the 1.1.0 matching method took 161 seconds with the
   same list).
-- Not yet done for 1.1.0 and 1.2.0: a run on Windows, a run against a real raw or E01 NetScaler image, and a run on
+- 1.3.0 added to the test disk the pitboss forms from public reporting and from the intrusion this tool was built on
+  (watchTowr's `NSPPE;id>/path;# X`, Unit 42's `NSPPE-00;...>, factor` form, `LOGIN_FAILED` with `Client_ip`,
+  `LOGIN REQ`, backticks with `${IFS}`), plus a URL-encoded user name and a probe with no command; genuine pitboss
+  and nsaaad records; a responder's grep in the shell audit log; two staged User-Agent payloads; the Unit 42 probe
+  paths; a real client package next to a disguised one; and the benign 55-byte `rc.netscaler`
+  (`nsapimgr_wr.sh -ys maxclientForHttpdInternalService=30`, SHA-256 `24aa659f...0d243903`, dated 2021). It also
+  added a second, clean NetScaler disk. Every forged line landed in B with the right injected command, genuine
+  records stayed in C and D, the grep stayed out of B, `rc.netscaler` was no longer reported, and the clean disk
+  produced no findings. All four formats gave identical results again, and the exit codes were checked with
+  `-File`. Matching 300,000 ordinary log lines took 0.1 seconds for B and 150,000 access-log lines 0.4 seconds for
+  B2.
+- Not yet done for 1.1.0 to 1.3.0: a run on Windows, a run against a real raw or E01 NetScaler image, and a run on
   one snapshot `.vmdk` given directly as `-Path`.
 
 ## Changes
+
+**1.3.0** (2026-10-22)
+
+- PITBOSS log poisoning is now found in all its public forms. 1.2.0 only matched the literal text `NSPPE;` in
+  `messages` and `ns.log`, so it missed `NSPPE-00;` (the form in Unit 42's hunting query), URL-encoded user names
+  and backtick or `$(...)` injections, and it never used the word pitboss. Hunt B (sheet renamed
+  `B_Pitboss_Log_Poisoning`) now reads every top-level log except shell history, A uses the same broader match on
+  `callhomedebug.log`, and the new B2 finds the base64 payloads staged in the User-Agent. `NSPPE_Injections` is now
+  `Pitboss_Injections`, with forged and Call Home counts per command and URL-decoded commands. The Word summary
+  leads with a PITBOSS bullet.
+- C and D also read `ns.log`, add the nsaaad restart-limit and pitboss system-failure messages, and never count a
+  forged record.
+- Fixed a false positive: `/flash/nsconfig/rc.netscaler` and `/var/cron/tabs/root` are no longer known IOC paths.
+  Both are normal files, and administrators use `rc.netscaler` for settings such as
+  `nsapimgr_wr.sh -ys maxclientForHttpdInternalService=30`. Their lines are still reviewed. The Word summary now
+  shows only flagged boot script and crontab lines. New flags: file created or modified in the review window,
+  crontab installed in the window, and lines that name a known implant file. A crontab header with an older install
+  date is no longer flagged.
+- From Unit 42's report (2026-09-30): requests to `GetUserName` and to the package-named webshells under
+  `/vpn/scripts/linux/` (E2), and a disk check of the VPN and EPA client download folders for disguised packages and
+  those names (Discovery).
+- Corrected the description of the built-in IP list: four Cloudflare WARP addresses that Unit 42 tied to this actor
+  were always included; 1.2.0 said all WARP addresses were left out.
+- Fixed: an output folder inside the evidence folder now ends the script with exit code 3, as documented (it ended
+  with 1).
 
 **1.2.0** (2026-10-19)
 

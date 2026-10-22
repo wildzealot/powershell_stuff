@@ -12,10 +12,11 @@
     3. exports /var/log and the known implant's text logs, with SHA-256 and original UTC times (export_manifest.csv);
     4. converts EVERY exported log to .xlsx (.gz rotations included; utx.log login records parsed into rows);
     5. runs the hunts: known IOC files with hashes, boot and cron hooks, a hidden / new file sweep, log hunts A to I,
-       injected NSPPE; commands, tunnel log, logins, NUL-byte runs in logs, network indicators and Fox-IT iocitrix;
+       PITBOSS log poisoning (forged pitboss / NSPPE records, the Call Home lines that run them, base64 payloads
+       staged in the User-Agent), tunnel log, logins, NUL-byte runs in logs, network indicators and Fox-IT iocitrix;
     6. writes <label>_Hunt_Results.xlsx per appliance and NetScaler_Findings_Summary.docx.
-  The generic hunts (log poisoning, crash loops, hidden and new files, boot and cron hooks, shell history, log
-  truncation) run on every image, and the known implant paths and attacker IPs are always checked as well: 189
+  The generic hunts (PITBOSS log poisoning, crash loops, hidden and new files, boot and cron hooks, shell history,
+  log truncation) run on every image, and the known implant paths and attacker IPs are always checked as well: 189
   built-in IPs, the 10 from the intrusion this tool was built on plus 179 C2, payload, exfiltration and exploit
   sources from public reporting up to 2026-10-19.
   Nothing is written inside the evidence folder. Implant scripts and webshells are recorded by hash only and are
@@ -94,7 +95,7 @@
 
   Raw image, extra attacker IPs read from a text file (one per line), Fox-IT checks skipped for a quicker run.
 .NOTES
-  Version 1.2.0. Works in Windows PowerShell 5.1 and PowerShell 7. Engine SHA-256 (LF line endings):
+  Version 1.3.0. Works in Windows PowerShell 5.1 and PowerShell 7. Engine SHA-256 (LF line endings):
   __ENGINE_SHA256__
 #>
 [CmdletBinding()]
@@ -115,7 +116,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ToolVersion = '1.2.0'
+$ToolVersion = '1.3.0'
 $EngineSha256 = '__ENGINE_SHA256__'
 $PythonVersion = '3.13.16'
 $Packages = @('dissect==3.22', 'tabulate==0.10.0', 'XlsxWriter==3.2.9', 'python-docx==1.2.0')
@@ -249,7 +250,8 @@ if (-not $OutDir) {
 $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir).TrimEnd('\', '/')
 $sep = [System.IO.Path]::DirectorySeparatorChar
 if ($OutDir -eq $Evidence -or $OutDir.StartsWith($Evidence + $sep, [System.StringComparison]::OrdinalIgnoreCase)) {
-  throw "-OutDir must not be inside the evidence folder ($Evidence)."
+  Write-Host "ERROR: -OutDir must not be inside the evidence folder ($Evidence)." -ForegroundColor Red
+  exit 3
 }
 if ($Since -and $Since -notmatch '^\d{4}-\d{2}-\d{2}$') { throw '-Since must look like yyyy-MM-dd.' }
 # -IocIp: accept lists, comma or space separated text, and lines of a file (text after # is a comment).

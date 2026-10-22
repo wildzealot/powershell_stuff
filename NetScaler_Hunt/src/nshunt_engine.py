@@ -38,6 +38,8 @@ All times are UTC. Syslog lines carry no year or zone; the year comes from the f
 the appliance clock is assumed to be UTC (the engine checks this against ns.log GMT stamps).
 """
 import argparse
+import base64
+import binascii
 import collections
 import contextlib
 import csv
@@ -57,9 +59,10 @@ import struct
 import sys
 import time
 import traceback
+import urllib.parse
 from pathlib import Path
 
-ENGINE_VERSION = "1.2.0"
+ENGINE_VERSION = "1.3.0"
 UTC = dt.timezone.utc
 XL_MAX_ROWS = 1048575      # data rows per sheet (one header row on top)
 XL_MAX_CELL = 32000        # Excel allows 32,767 characters per cell
@@ -92,7 +95,9 @@ CASE_IOC_IPS = [
 #    eSentire, Mandiant, GreyNoise, Arctic Wolf, Sygnia, Truesec, Beazley, TENEX, SOCRadar, Lupovis, Corelight, IFIN, and
 #    the Poppelgaard checker (which relays Gotham Technology Group IR and Huntback.io decoy data). Only C2, payload,
 #    staging and exfiltration servers (reported-infra) and webshell users and exploit sources named by vendor or IR
-#    reports (reported-exploit) are included; mass-scan feeds, Tor exits and Cloudflare WARP addresses are left out.
+#    reports (reported-exploit) are included; mass-scan feeds and Tor exits are left out, and so are Cloudflare WARP
+#    addresses except the four that Unit 42 tied to this actor's webshell and GetUserName requests (ordinary WARP
+#    users share those too, so a hit on one of them is weak on its own).
 #    One line per IP: ip | level | what it was seen doing (sources).
 REPORTED_AS_OF = "2026-10-19"
 _REPORTED_IOC_IPS = """
@@ -303,10 +308,11 @@ KNOWN_IOC_PATHS = [
     ("/var/netscaler/logon/LogonPoint/custom/.slap.receiver", "Webshell copy, served at /logon/LogonPoint/custom/.slap.receiver"),
     ("/var/netscaler/logon/LogonPoint/custom/receiver.deb", "Webshell copy, served at /logon/LogonPoint/custom/receiver.deb"),
     ("/var/cron/tabs/nobody", "Crontab of the nobody user (the web server account)"),
-    ("/var/cron/tabs/root", "Per-user crontab of root (only created when someone runs the crontab command as root)"),
-    ("/flash/nsconfig/rc.netscaler", "Boot script run at every start (see the Hooks sheet)"),
     ("/flash/nsconfig/rc.netscaler.ptbak", "Copy of rc.netscaler kept when rc.netscaler was rewritten (holds the earlier version)"),
 ]
+# Not listed above on purpose: /flash/nsconfig/rc.netscaler and /var/cron/tabs/root. Administrators use both for
+# ordinary settings (for example nsapimgr_wr.sh tuning), so their presence is not an indicator. Their lines are
+# reviewed on the Hooks sheet instead, and only flagged lines reach the Word summary.
 KNOWN_IOC_RX = re.compile(
     r"(^|/)\.(slap|relay|ux)(/|$)|^/flash/\.nsvm(/|$)"
     r"|^/var/tmp/\.(slap-[^/]+|relay-(ssh|socks)\.log)$|^/var/tmp/\.s2loot(\.log$|/|$)"
@@ -320,18 +326,147 @@ IMPLANT_LOG_EXPORTS = [
     "/var/tmp/.slap-httpd-test.log", "/flash/.nsvm/.agent.log", "/flash/.nsvm/.wd.log",
 ]
 IMPLANT_STRINGS = (r"\.slap|/\.ux/|slapshot|whipd|receiver\.deb|ctxs\.receiver|slap\.receiver|CsrfToken|\.relay|guard\.sh"
-                   r"|s2loot|nsvmd|\.nsvm|v5v\.in|vcscan|reverse-agent")
+                   r"|s2loot|nsvmd|\.nsvm|v5v\.in|vcscan|reverse-agent|e826d7ddf3c85920")
 
-# Hunt sections A-I: file name filters and patterns, case-insensitive. Only files directly in /var/log are read, except
-# for H, which reads every exported text log. H is built from BUILTIN_IOC_IPS plus --ioc-ip.
+# ------------------------------------------------------------------ PITBOSS log poisoning (CVE-2026-88771)
+# Stage 1: a base64 payload is parked in the User-Agent of a web request (httpaccess*.log). Stage 2: a failed login
+# whose user name imitates a pitboss crash record ("pitboss PPE missed too many heartbeatsNSPPE;<command>",
+# "pitboss PPE unexpectedly died NSPPE-00;<command>;# X") is written to ns.log. Stage 3: the Call Home crash checker
+# (/netscaler/ns_monuploadd_err.pl) reads ns.log, takes the text after NSPPE and runs it with sh or php, usually
+# pulling the stage 1 payload back out of the access log. Genuine pitboss records come from the pitboss process itself
+# ("pitboss[26]: ... NSPPE-01 (11854) unexpectedly died") and never carry a command, so they are hunted separately (C, D).
+_SHELL_META = r"(?:[;`|]|\$\(|\$\{|&&|%3b|%60|%7c|%24%28|%24%7b|%26%26)"
+PITBOSS_FORGED_RX = re.compile(
+    r"NSPPE(?:-\d+)?\s{0,2}" + _SHELL_META                                   # a command right after NSPPE / NSPPE-00
+    + r"|pitboss.{0,200}?PPE.{0,80}?(?:`|\$\(|\$\{)"                         # pitboss text with `...`, $(...) or ${IFS}
+    + r"|pitboss.{0,200}?(?:missed too many heartbeats|unexpectedly died).{0,200}?" + _SHELL_META
+    + r"|(?:\buser(?:name)?\s*:?\s*<?|\bcontext\s+|\bfor\s+<|packet engine for\s+)(?:\S{1,12}\s+)?pitboss",  # in a user name
+    re.I)
+# Lines that quote the pattern instead of carrying it: CLI command audit records in ns.log (a responder's
+# shell "grep ..." run from the NetScaler CLI) and regular expressions written by people hunting for it.
+PITBOSS_QUOTE_RX = re.compile(r"CMD_EXECUTED|pitboss\.\*|NSPPE\.\*", re.I)
+CALLHOME_INJECT_RX = re.compile(
+    r"NSPPE(?:-\d+)?\s{0,2}" + _SHELL_META + r"|NSPPE\S{0,8}\s{0,2}[^\s`$]{0,40}(?:`|\$\(|\$\{)", re.I)
+# Text of the injected command: after NSPPE; up to the attacker's comment (;# X) or the end of the logged user name.
+INJECT_CMD_RX = re.compile(
+    r"NSPPE(?:-\d+)?\s{0,2};(?P<cmd>.*?)(?=\s*;\s*#[\s+-]*X\b|\s*#[\s+]*-[\s+]*X\b|>\s*,\s*factor\b|>\"?\s*$|\"\s*$"
+    r"|\s+-\s+Client_ip\b|\s*,\s*trying to find\b|$)", re.I)
+INJECT_SUBST_RX = re.compile(r"`([^`]{1,800})`|\$\((.{1,800}?)\)")
+CLIENT_IP_RX = re.compile(r"Client_?ip[:\s]+([0-9A-Fa-f.:]{3,})|@(\d{1,3}(?:\.\d{1,3}){3})\b", re.I)
+# Stage 1 payloads: base64 after INDEX: or K: (as reported by Zscaler), base64 of "<?php" (PD9waHA), or any long base64
+# run with upper case, lower case and digits. Only the User-Agent field is examined.
+UA_PAYLOAD_RX = re.compile(r"(?P<mark>INDEX:|\bK:)(?P<pre>[A-Za-z0-9+/=]{16,})|(?P<run>[A-Za-z0-9+/]{60,}={0,2})"
+                           r"|(?P<php>PD9waHA[A-Za-z0-9+/]*={0,2})")
+# SHA-256 of payloads published by Unit 42 (2026-09-30): the base64 text and the shell script it decodes to.
+KNOWN_PAYLOAD_SHA256 = {
+    "1bd314b661396c7086f6367fbbb48025e03ca2de69c073d53a8b0a38aa5fbb7d": "Unit 42 published hash (base64 payload)",
+    "79c65fa04541032e251fa4796b97800374b63c7982593dd1a2e0db605d429186": "Unit 42 published hash (decoded shell script)",
+}
+
+
+class PitbossMatcher:
+    """Hunt B: forged pitboss / NSPPE records. A substring check skips the regex on almost every line."""
+
+    def search(self, text):
+        low = text.lower()
+        if "nsppe" not in low and "pitboss" not in low:
+            return None
+        if PITBOSS_QUOTE_RX.search(text):
+            return None
+        return PITBOSS_FORGED_RX.search(text)
+
+
+class CallHomeMatcher:
+    """Hunt A: Call Home crash checker lines that carry an injected command."""
+
+    def search(self, text):
+        if "nsppe" not in text.lower():
+            return None
+        return CALLHOME_INJECT_RX.search(text)
+
+
+def user_agent(text):
+    """The last quoted field of an access-log line (the User-Agent); '' when the line has fewer than two."""
+    s = text.rstrip()
+    if s.count('"') < 4:
+        return ""
+    j = s.rfind('"')
+    i = s.rfind('"', 0, j)
+    return s[i + 1:j] if i >= 0 else ""
+
+
+def ua_payload(ua):
+    """(marker, base64 text) of a payload staged in a User-Agent, or None."""
+    for m in UA_PAYLOAD_RX.finditer(ua):
+        if m.group("pre"):
+            return m.group("mark"), m.group("pre")
+        if m.group("php"):
+            return "PD9waHA (base64 of <?php)", m.group("php")
+        run = m.group("run")
+        if re.search(r"[A-Z]", run) and re.search(r"[a-z]", run) and re.search(r"\d", run):
+            return "long base64 run", run
+    return None
+
+
+class UaPayloadMatcher:
+    """Hunt B2: web requests whose User-Agent carries a base64 payload (PITBOSS stage 1)."""
+
+    def search(self, text):
+        ua = user_agent(text)
+        if len(ua) < 16:
+            return None
+        # quick exit for ordinary agents: no marker and no whitespace-free stretch long enough to hold a 60-char run
+        if "INDEX:" not in ua and "K:" not in ua and "PD9waHA" not in ua and not any(len(w) >= 60 for w in ua.split()):
+            return None
+        return ua_payload(ua)
+
+
+def decode_b64(s):
+    """Bytes of a base64 text, tolerating missing padding; b'' when it is not base64."""
+    s = re.sub(r"[^A-Za-z0-9+/]", "", s)
+    if len(s) % 4 == 1:
+        s = s[:-1]
+    try:
+        return base64.b64decode(s + "=" * (-len(s) % 4))
+    except (binascii.Error, ValueError):
+        return b""
+
+
+def payload_kind(raw):
+    """What a decoded payload is, without keeping its content."""
+    if not raw:
+        return "not valid base64"
+    txt = raw[:8192].decode("utf-8", "replace")
+    if "<?php" in txt or "<?=" in txt:
+        return "PHP code"
+    good = sum(1 for ch in txt if ch.isprintable() or ch in "\r\n\t")
+    if good / len(txt) < 0.85:
+        return f"binary ({len(raw)} bytes)"
+    if txt.startswith("#!") or re.search(r"\b(curl|wget|fetch|sh|bash|echo|chmod|mkdir|base64|perl|python3?|php|tar|nc)\b",
+                                         txt):
+        return "shell commands"
+    return "text"
+
+
+# Hunt sections: file name filters ("!" excludes) and patterns (case-insensitive) or matcher objects. Only files
+# directly in /var/log are read, except for H, which reads every exported text log. H is built from BUILTIN_IOC_IPS
+# plus --ioc-ip. Shell history and audit logs are left out of B: responders' own grep commands quote the pattern.
 SECTIONS = [
-    ("A", "A_CallHome_Exec", "Injected commands executed by the call-home crash checker", ["callhomedebug*"], r"NSPPE;"),
-    ("B", "B_Poisoned_Entries", "Log-poisoning entries (user names containing NSPPE;)", ["messages*", "ns.log*"], r"NSPPE;"),
-    ("C", "C_nsaaad_Crash_Reboot", "nsaaad crash loops and pitboss reboots", ["messages*"],
-     r"nsaaad \(\d+\) unexpectedly died|Pitboss rebooted the system"),
-    ("D", "D_NSPPE_Crashes", "Packet engine (NSPPE) crashes", ["messages*"], r"pitboss.*NSPPE-\d+ \(\d+\) unexpectedly died"),
+    ("A", "A_CallHome_Exec", "PITBOSS stage 3: Call Home crash checker lines that carry an injected command",
+     ["callhomedebug*"], CallHomeMatcher()),
+    ("B", "B_Pitboss_Log_Poisoning", "PITBOSS stage 2: forged pitboss / NSPPE records (CVE-2026-88771 log poisoning)",
+     ["*", "!callhomedebug*", "!notice.log*", "!sh.log*", "!bash.log*"], PitbossMatcher()),
+    ("B2", "B2_Staged_UA_Payloads", "PITBOSS stage 1: base64 payloads staged in the User-Agent", ["httpaccess*"],
+     UaPayloadMatcher()),
+    ("C", "C_nsaaad_Crash_Reboot", "nsaaad crashes, restart limits and pitboss reboots", ["messages*", "ns.log*"],
+     r"nsaaad \(\d+\) unexpectedly died|Pitboss rebooted the system|proc nsaaad.*(?:SIGNALED|EXITED)"
+     r"|maximum number of restarts|Pitboss declaring system failure|All monitored processes have exited, rebooting"),
+    ("D", "D_NSPPE_Crashes", "Genuine packet engine (NSPPE) crash records from pitboss", ["messages*", "ns.log*"],
+     r"pitboss.*NSPPE-\d+ \(\d+\) (?:unexpectedly died|missed too many heartbeats)|pitboss.*NOT restarting NSPPE"),
     ("E", "E_Webshell_Requests", "Requests to the webshell paths", ["httpaccess*"], r"/logon/LogonPoint/custom/(receiver|\.ctxs|\.slap)"),
-    ("E2", "E2_Other_Probe_Paths", "Requests to other implant or probe paths", ["httpaccess*"], r"receiver\.min|/vpn/media/[^ ]+\.ico|:9910"),
+    ("E2", "E2_Other_Probe_Paths", "Requests to other implant or probe paths", ["httpaccess*"],
+     r"receiver\.min|/vpn/media/[^ ]+\.ico|:9910|/logon/LogonPoint/Authentication/GetUserName"
+     r"|/vpn/scripts/linux/(?:nsgclient18|nsgser18|nsgsupport|nsgpackage64|nsgbuild|nsg64)\.deb\b"),
     ("F", "F_Relay_Installer", ".relay installer lines in the shell audit log", ["notice.log*"],
      r"/nsconfig/\.relay|relay\.env|target_agent|ssh -N -R"),
     ("G", "G_Implant_Cron_Runs", "Cron runs of the implant", ["cron*"], r"/nsconfig/\.(slap|relay)/"),
@@ -359,6 +494,12 @@ TMP_NOISE_RX = re.compile(
     r"^/var/(tmp|nstmp)/(par-[0-9a-f]+(/|$)|log-\d{4}-\d\d-\d\d\.php$|[\w.]*_(bios|bmc)\.bin$|(bios|bmc)_releases$"
     r"|Fortville_Silicom_Intel(/|$)|Mellanox(/|$)|sum$|install$|tmp[\w]{8}$|ch_metrics\.txt$)")
 WEB_NOISE_RX = re.compile(r"^/var/(run|netscaler/gui|netscaler/nitro|vpn/themes|app_catalog|nsinstall)/")
+# VPN and EPA client download folders (served as /vpn/scripts/linux/ and /epa/scripts/linux/). Unit 42 (2026-09-30)
+# reported the actor hosting webshells there under package-like names. A real .deb starts with "!<arch>\n" and a real
+# .rpm with ED AB EE DB; anything else with those extensions is a disguised file.
+CLIENT_PKG_DIR_RX = re.compile(r"^/var/netscaler/gui/(vpn|epa)/scripts/linux/[^/]+$")
+UNIT42_PKG_NAMES = {"nsgclient18.deb", "nsgser18.deb", "nsgsupport.deb", "nsgpackage64.deb", "nsgbuild.deb", "nsg64.deb"}
+PKG_MAGIC = {".deb": b"!<arch>\n", ".rpm": b"\xed\xab\xee\xdb"}
 WALK_SKIP_WINDOW = ("/var/log/", "/var/nslog/", "/var/nstrace/", "/var/core/", "/var/crash/", "/var/netscaler/locdb/",
                     "/var/mastools/logs/")
 
@@ -1068,8 +1209,12 @@ def check_known_iocs(t):
 HOOK_FILES_GLOB = [("/flash/nsconfig", r"^(rc\.netscaler.*|nsafter\.sh|nsbefore\.sh)$"), ("/var/cron/tabs", r".*")]
 
 
-def check_hooks(t):
+def check_hooks(t, since="", until=""):
+    """Every line of the boot scripts and crontabs, with flags for what deserves a look. The files themselves are
+    normal on a NetScaler (rc.netscaler holds ordinary settings), so only flagged lines are findings. A file created
+    or modified in the review window gets a file-level row ("line" empty)."""
     rows = []
+    x_rx = re.compile(IMPLANT_STRINGS, re.I)
     for folder, rx in HOOK_FILES_GLOB:
         if not exists(t, folder):
             continue
@@ -1086,18 +1231,34 @@ def check_hooks(t):
                     base_flags.append("crontab owned by nobody")
                 if meta["size"] == 0:
                     base_flags.append("empty crontab")
+            changed = []
+            if since and meta["btime"] and since <= meta["btime"] < until:
+                changed.append("file created in the review window")
+            if since and meta["mtime"] and since <= meta["mtime"] < until:
+                changed.append("file modified in the review window")
             if not text.strip():
-                rows.append({"file": str(e), "line": "", "text": "(empty file)", "flags": "; ".join(base_flags),
-                             "mtime": meta["mtime"], "btime": meta["btime"], "sha256": meta["sha256"]})
+                rows.append({"file": str(e), "line": "", "text": "(empty file)", "flags": "; ".join(base_flags + changed),
+                             "mtime": meta["mtime"], "btime": meta["btime"], "sha256": meta["sha256"], "installed": ""})
                 continue
+            if changed:
+                rows.append({"file": str(e), "line": "", "text": f"(whole file: modified {meta['mtime']}, created "
+                                                                  f"{meta['btime'] or 'unknown'})",
+                             "flags": "; ".join(changed), "mtime": meta["mtime"], "btime": meta["btime"],
+                             "sha256": meta["sha256"], "installed": ""})
             for i, line in enumerate(text.splitlines(), 1):
                 s = line.strip()
                 if not s:
                     continue
                 flags = [] if s.startswith("#") else list(base_flags)
+                installed = ""
                 m = re.search(r"\((\S+) installed on (.+?)\)", s)
-                if m:
-                    flags.append(f"installed from {m.group(1)} on {m.group(2)}")
+                if m:    # crontab header: flagged when the install time is in the review window or cannot be read
+                    installed = f"installed from {m.group(1)} on {m.group(2)}"
+                    when = cron_header_time(m.group(2))
+                    if not when:
+                        flags.append(installed)
+                    elif since and since <= when < until:
+                        flags.append(installed + " (in the review window)")
                 if not s.startswith("#"):
                     if re.search(r"/\.[A-Za-z0-9_-]", s):
                         flags.append("runs something in a hidden folder")
@@ -1109,9 +1270,40 @@ def check_hooks(t):
                         flags.append("network or encoding tool")
                     if IPV4_RX.search(s):
                         flags.append("contains an IP address")
+                    if x_rx.search(s):
+                        flags.append("names a known implant file or string")
                 rows.append({"file": str(e), "line": i, "text": line, "flags": "; ".join(flags),
-                             "mtime": meta["mtime"], "btime": meta["btime"], "sha256": meta["sha256"]})
+                             "mtime": meta["mtime"], "btime": meta["btime"], "sha256": meta["sha256"],
+                             "installed": installed})
     return rows
+
+
+def cron_header_time(text):
+    """'Mon Dec  6 10:00:00 2021' (crontab header, appliance clock) -> '2021-12-06 10:00:00', or ''."""
+    m = re.search(r"\w{3} (\w{3}) +(\d+) (\d\d:\d\d:\d\d) (\d{4})", text)
+    if not m or m.group(1) not in MONTHS:
+        return ""
+    return f"{m.group(4)}-{MONTHS[m.group(1)]:02d}-{int(m.group(2)):02d} {m.group(3)}"
+
+
+def client_pkg_category(e, p, kind):
+    """Discovery category for a file in the VPN / EPA client download folders that needs a look, else None."""
+    if kind != "file" or not CLIENT_PKG_DIR_RX.match(p):
+        return None
+    name = p.rsplit("/", 1)[1]
+    if name.lower() in UNIT42_PKG_NAMES:
+        return "Lead: client download folder: file name Unit 42 reported as a webshell"
+    magic = PKG_MAGIC.get(os.path.splitext(name)[1].lower())
+    if magic is None:
+        return None
+    try:
+        with e.open("rb") as fh:
+            head = fh.read(len(magic))
+    except Exception:
+        return "Lead: client download folder: package could not be read"
+    if head != magic:
+        return "Lead: client download folder: not a real package, possibly a disguised webshell"
+    return None
 
 
 def discovery_walk(t, since, until):
@@ -1127,8 +1319,10 @@ def discovery_walk(t, since, until):
             mt = ts(st.st_mtime)
             hidden = any(x.startswith(".") for x in p.split("/") if x)
             born_in = bool(b) and s <= b < u
-            cat = None
-            if KNOWN_IOC_RX.search(p):
+            cat = client_pkg_category(e, p, kind)
+            if cat:
+                pass
+            elif KNOWN_IOC_RX.search(p):
                 cat = "IOC: known implant artifact"
             elif hidden and BENIGN_HIDDEN_RX.search(p):
                 cat = "Context: standard hidden file"
@@ -1288,15 +1482,16 @@ class Hunts:
         self.ip_rx = IpMatcher(self.ioc_ips) if self.ioc_ips else None
         self.sections = []
         for key, sheet, title, pats, rx in SECTIONS:
-            crx = self.ip_rx if key == "H" else re.compile(rx, re.I)
+            crx = self.ip_rx if key == "H" else re.compile(rx, re.I) if isinstance(rx, str) else rx
             if crx is None:
                 continue
             self.sections.append((key, sheet, title, pats, crx))
         self.hits = {k: [] for k, *_ in self.sections}
-        self.e_rx = re.compile(SECTIONS[4][4], re.I)
+        self.e_rx = re.compile(next(s[4] for s in SECTIONS if s[0] == "E"), re.I)
+        self.forged = PitbossMatcher()
         self.x_rx = re.compile(IMPLANT_STRINGS, re.I)
         self.x = {}
-        self.nsppe = []
+        self.nsppe = []      # (file, line, time, text, section) of every A and B hit: the PITBOSS injections
         self.audit = {}
         self.nul = []
         self.utx = []
@@ -1308,10 +1503,17 @@ class Hunts:
 
     def applicable(self, name, top_level):
         name = name.lower()
-        return [(k, rx) for k, _s, _t, pats, rx in self.sections
-                if (top_level or k == "H") and any(fnmatch.fnmatchcase(name, p) for p in pats)]
+        out = []
+        for k, _s, _t, pats, rx in self.sections:
+            if not (top_level or k == "H"):
+                continue
+            if any(fnmatch.fnmatchcase(name, p) for p in pats if not p.startswith("!")) and \
+                    not any(fnmatch.fnmatchcase(name, p[1:]) for p in pats if p.startswith("!")):
+                out.append((k, rx))
+        return out
 
     def line(self, rel, ln, text, t_utc, act, top_level, file_name):
+        forged = None
         for key, rx in act:
             m = rx.search(text)
             if not m:
@@ -1320,7 +1522,14 @@ class Hunts:
                 continue
             if key == "I" and SECTION_I_EXCLUDE.search(text):
                 continue
+            if key in ("C", "D"):            # genuine crash records only; forged ones are B
+                if forged is None:
+                    forged = bool(self.forged.search(text))
+                if forged:
+                    continue
             self.hits[key].append((rel, ln, t_utc, m.group(1) if key == "H" else "", text))
+            if key in ("A", "B"):
+                self.nsppe.append((rel, ln, t_utc, text, key))
         m = self.x_rx.search(text)
         if m:
             e = self.x.setdefault(rel, [0, "", "", set()])
@@ -1330,8 +1539,6 @@ class Hunts:
                 e[1] = e[1] or t_utc
                 e[2] = t_utc
         if top_level:
-            if "NSPPE;" in text:
-                self.nsppe.append((rel, ln, t_utc, text))
             low = file_name.lower()
             if low.startswith("notice.log") and 'sh_command="' in text:
                 cmd = text.split('sh_command="', 1)[1].rstrip().rstrip('"').strip()
@@ -1459,7 +1666,10 @@ def summarize_sections(hunts):
         rows = hunts.hits[key]
         times = sorted(r[2] for r in rows if r[2])
         files = collections.Counter(r[0] for r in rows)
-        out.append({"key": key, "sheet": sheet, "title": title, "files_filter": ", ".join(pats), "count": len(rows),
+        inc = ", ".join(p for p in pats if not p.startswith("!"))
+        exc = ", ".join(p[1:] for p in pats if p.startswith("!"))
+        out.append({"key": key, "sheet": sheet, "title": title, "files_filter": inc + (f" (except {exc})" if exc else ""),
+                    "count": len(rows),
                     "count_top_level": sum(1 for r in rows if "/" not in r[0]),
                     "first": times[0] if times else "", "last": times[-1] if times else "",
                     "files": "; ".join(f"{f} ({n})" for f, n in files.most_common())})
@@ -1525,27 +1735,77 @@ def webshell_by_ip(ws_rows):
     return out
 
 
+NO_COMMAND = "(no command: pitboss text in a user name only)"
+
+
+def injected_command(text):
+    """The command carried by a forged pitboss / NSPPE record (URL-decoded), or NO_COMMAND."""
+    if "%" in text:
+        text = urllib.parse.unquote(text)
+    m = INJECT_CMD_RX.search(text)
+    cmd = m.group("cmd") if m else ""
+    if not cmd.strip():
+        m = INJECT_SUBST_RX.search(text)
+        if m:
+            cmd = m.group(1) or m.group(2) or ""
+    cmd = re.sub(r"\s+", " ", cmd).strip()
+    return cmd[:300] if cmd else NO_COMMAND
+
+
 def nsppe_summary(hunts):
+    """PITBOSS injections (hunts A and B) grouped by injected command."""
     found = collections.OrderedDict()
-    for rel, ln, t_utc, text in hunts.nsppe:
-        m = re.search(r"NSPPE;(.*?)(?:;\s*#\s*X|;#-X|#-X|>|\s-\sClient_ip|$)", text)
-        cmd = re.sub(r"\s+", " ", (m.group(1) if m else "?")).strip()[:300]
-        e = found.setdefault(cmd, {"n": 0, "times": [], "ips": set(), "files": collections.Counter()})
+    for rel, ln, t_utc, text, key in hunts.nsppe:
+        cmd = injected_command(text)
+        e = found.setdefault(cmd, {"n": 0, "by": collections.Counter(), "times": [], "ips": set(),
+                                   "files": collections.Counter()})
         e["n"] += 1
+        e["by"][key] += 1
         if t_utc:
             e["times"].append(t_utc)
-        ip = re.search(r"Client_ip (\S+)", text)
-        if ip:
-            e["ips"].add(ip.group(1))
+        for a, b in CLIENT_IP_RX.findall(text):
+            ip = norm_ip(a or b)
+            if ip:
+                e["ips"].add(ip)
         e["files"][rel] += 1
     out = []
     for cmd, e in found.items():
         urls = sorted(set(URL_RX.findall(cmd)))
-        out.append({"injected": cmd, "count": e["n"], "first": min(e["times"]) if e["times"] else "",
-                    "last": max(e["times"]) if e["times"] else "", "client_ips": ", ".join(sorted(e["ips"])),
+        out.append({"injected": cmd, "count": e["n"], "forged": e["by"]["B"], "callhome": e["by"]["A"],
+                    "first": min(e["times"]) if e["times"] else "", "last": max(e["times"]) if e["times"] else "",
+                    "client_ips": ", ".join(sorted(e["ips"])),
                     "files": "; ".join(f"{f} ({n})" for f, n in e["files"].most_common()),
                     "urls": " ".join(urls), "ips_in_text": ", ".join(sorted(set(IPV4_RX.findall(cmd))))})
+    out.sort(key=lambda x: (x["injected"] == NO_COMMAND, x["first"] or "9999"))
     return out
+
+
+def ua_payload_rows(hunts):
+    """Hunt B2 hits with the payload measured and hashed. The decoded content itself is never written out, only
+    its kind, SHA-256 and the URLs and IPs inside it."""
+    rows = []
+    for rel, ln, t_utc, _d, text in hunts.hits.get("B2", []):
+        clean = text.lstrip("\x00")
+        m = HTTPACC_RX.match(clean)
+        ua = user_agent(clean)
+        mark, b64 = ua_payload(ua) or ("", "")
+        raw = decode_b64(b64)
+        dec = raw.decode("utf-8", "replace")
+        hashes = {hashlib.sha256(b64.encode()).hexdigest(), hashlib.sha256((b64 + "\n").encode()).hexdigest()}
+        h_dec = hashlib.sha256(raw).hexdigest() if raw else ""
+        known = sorted({KNOWN_PAYLOAD_SHA256[h] for h in hashes | {h_dec} if h in KNOWN_PAYLOAD_SHA256})
+        req = (m.group("req") or "").split(" ") if m else []
+        ip = m.group("ip") if m else ""
+        if not ip:
+            mi = IPV4_RX.search(clean)
+            ip = mi.group(1) if mi else ""
+        rows.append({"time": t_utc, "ip": ip, "method": req[0] if req else "",
+                     "path": (req[1] if len(req) > 1 else "").split("?")[0], "status": m.group("status") if m else "",
+                     "marker": mark, "length": len(b64), "kind": payload_kind(raw),
+                     "sha_b64": hashlib.sha256(b64.encode()).hexdigest(), "sha_dec": h_dec, "known": "; ".join(known),
+                     "urls": " ".join(sorted(set(URL_RX.findall(dec))))[:2000],
+                     "ips": ", ".join(sorted(set(IPV4_RX.findall(dec))))[:1000], "ua": ua, "file": rel, "line": ln})
+    return rows
 
 
 def agent_log_rows(local, mtime_s):
@@ -1589,10 +1849,10 @@ def timeline(label, ioc_rows, hooks, sec_summary, ws_by_ip, hunts, agent_rows, l
             if r["mtime"] and r["mtime"] != r["btime"]:
                 add(r["mtime"], "file system", f"modified {r['path']}", f"size now {r['size']} bytes")
     for h in hooks:
-        m = re.search(r"installed from (\S+) on \w{3} (\w{3}) +(\d+) (\d\d:\d\d:\d\d) (\d{4})", h["flags"])
-        if m:
-            t_ = f"{m.group(5)}-{MONTHS.get(m.group(2), 1):02d}-{int(m.group(3)):02d} {m.group(4)}"
-            add(t_, "crontab header", f"crontab {Path(h['file']).name} installed from {m.group(1)}", "appliance clock")
+        m = re.search(r"installed from (\S+) on (.+)$", h.get("installed", ""))
+        if m and cron_header_time(m.group(2)):
+            add(cron_header_time(m.group(2)), "crontab header", f"crontab {Path(h['file']).name} installed from {m.group(1)}",
+                "appliance clock")
     for s in sec_summary:
         if s["count"]:
             add(s["first"], f"log hunt {s['key']}", f"first: {s['title']}", f"{s['count']} line(s) in total")
@@ -1710,7 +1970,7 @@ def hunt_image(cand, img_path, label, out_root, args, run):
 
     say(f"[{label}] checking known IOC paths, boot and cron hooks")
     res["ioc"] = check_known_iocs(t)
-    res["hooks"] = check_hooks(t)
+    res["hooks"] = check_hooks(t, ts(since), ts(until))
     base_presence = {}
     if cand and cand["base"] != img_path:
         try:
@@ -1760,6 +2020,7 @@ def hunt_image(cand, img_path, label, out_root, args, run):
     res["webshell"] = webshell_rows(hunts)
     res["webshell_by_ip"] = webshell_by_ip(res["webshell"])
     res["nsppe"] = nsppe_summary(hunts)
+    res["ua_payloads"] = ua_payload_rows(hunts)
     res["shell_distinct"] = shell_distinct(hunts)
     clock_diff = sorted({(a, b) for a, b in hunts.clock if a != b})
     res["clock_note"] = ("syslog and GMT stamps agree in ns.log (appliance clock is UTC)" if hunts.clock and not clock_diff
@@ -1818,15 +2079,32 @@ def network_iocs(res, args):
     for ip, e in per_ip.items():
         add(ip, "ip", "requested a webshell path", "; ".join(e["paths"]), e["first"], e["last"], e["n"],
             f"{e['body']} non-empty response(s); status codes {', '.join(e['status'])}")
+    where_pb = "PITBOSS injected commands (hunts A and B)"
     for n in res["nsppe"]:
         for u in n["urls"].split():
-            add(u, "url", "callback URL in an injected command", "NSPPE; log lines", n["first"], n["last"], n["count"])
+            add(u, "url", "callback URL in an injected command", where_pb, n["first"], n["last"], n["count"])
             host = re.sub(r"^\w+://", "", u).split("/")[0].split("@")[-1].rsplit(":", 1)[0]
             add(host, "ip" if IPV4_RX.fullmatch(host) else "domain", "callback host in an injected command",
-                "NSPPE; log lines", n["first"], n["last"], n["count"])
+                where_pb, n["first"], n["last"], n["count"])
         for ip in n["ips_in_text"].split(", "):
             if ip:
-                add(ip, "ip", "IP inside an injected command", "NSPPE; log lines", n["first"], n["last"], n["count"])
+                add(ip, "ip", "IP inside an injected command", where_pb, n["first"], n["last"], n["count"])
+        for ip in n["client_ips"].split(", "):
+            if ip:
+                add(ip, "ip", "client IP of a forged pitboss / NSPPE login", where_pb, n["first"], n["last"], n["count"])
+    for w in res.get("ua_payloads", []):
+        where = f"/var/log/{w['file']}"
+        if w["ip"]:
+            add(norm_ip(w["ip"]) or w["ip"], "ip", "sent a base64 payload in the User-Agent (PITBOSS stage 1)", where,
+                w["time"], w["time"], detail=f"payload: {w['kind']}")
+        for u in w["urls"].split():
+            add(u, "url", "URL inside a staged User-Agent payload", where, w["time"], w["time"])
+            host = re.sub(r"^\w+://", "", u).split("/")[0].split("@")[-1].rsplit(":", 1)[0]
+            add(host, "ip" if IPV4_RX.fullmatch(host) else "domain", "host inside a staged User-Agent payload", where,
+                w["time"], w["time"])
+        for ip in w["ips"].split(", "):
+            if ip:
+                add(ip, "ip", "IP inside a staged User-Agent payload", where, w["time"], w["time"])
     for m in res["manifest"]:
         if m["image_path"].endswith(".relay-ssh.log") and m["exported_to"]:
             txt = Path(m["exported_to"]).read_text(encoding="utf-8", errors="replace")
@@ -1883,9 +2161,18 @@ def write_workbook(res, path, args):
         f"Generated {now_utc()} UTC by nshunt_engine {ENGINE_VERSION}. All times are UTC.",
         f"Review window: {res['since']} to {res['until']} (used by the Discovery sheet).",
         "Sheets: Summary, Target, Disk_Chain, IOC_Files (known implant paths with SHA-256), Hooks (boot script and "
-        "crontab lines), Discovery (hidden, implant-like and new items), A to I (log hunt hits), Hunt_Summary, I_Shell_Distinct, Webshell_by_IP, "
-        "NSPPE_Injections, Network_IOCs, Agent_Log (tunnel log), Logins_utx, Shell_Audit_Rare, Log_Integrity_NUL, "
-        "Implant_Strings_by_File, FoxIT_iocitrix, Timeline, Log_Inventory, Export_Manifest.",
+        "crontab lines), Discovery (hidden, implant-like and new items), A to I (log hunt hits), Hunt_Summary, "
+        "I_Shell_Distinct, Webshell_by_IP, Pitboss_Injections, Network_IOCs, Agent_Log (tunnel log), Logins_utx, "
+        "Shell_Audit_Rare, Log_Integrity_NUL, Implant_Strings_by_File, FoxIT_iocitrix, Timeline, Log_Inventory, "
+        "Export_Manifest.",
+        "PITBOSS log poisoning (CVE-2026-88771): B lists forged pitboss / NSPPE records in any top-level /var/log file "
+        "(a login user name that imitates a pitboss crash record, usually with a command after NSPPE); A lists Call Home "
+        "crash checker lines (callhomedebug.log) that carry such a command, the step that runs it; B2 lists web requests "
+        "whose User-Agent holds a base64 payload (the stage the command usually fetches and runs). Pitboss_Injections "
+        "groups A and B by injected command. Genuine pitboss crash records are in C and D, never in B.",
+        "Hooks: rc.netscaler, nsbefore.sh, nsafter.sh and crontabs are normal files; a line is a finding only when it "
+        "has flags. A row with no line number is about the whole file (empty, or created or modified in the review "
+        "window).",
         "Every exported log is also saved as its own .xlsx under logs_xlsx (same folder layout as the image).",
         "Line numbers refer to the exported log files under logs (decompressed for .gz).",
         "Hunt H searches every log for the built-in attacker IPs (the intrusion this tool was built on, plus public "
@@ -1911,7 +2198,9 @@ def write_workbook(res, path, args):
                  f"from public reporting up to {REPORTED_AS_OF}) + {n_sup} supplied with -IocIp"])
     for s in res["sections"]:
         summ.append([f"Hunt {s['key']}: {s['title']}", s["count"]])
-    summ += [["Distinct injected commands (NSPPE;)", len(res["nsppe"])],
+    summ += [["Distinct PITBOSS injected commands (A and B)",
+              sum(1 for n in res["nsppe"] if n["injected"] != NO_COMMAND)],
+             ["Staged User-Agent payloads (B2)", len(res["ua_payloads"])],
              ["Tunnel opens in agent.log", sum(1 for r in res["agent"] if r["kind"] == "open")],
              ["Logs with NUL-byte runs", len({x[0] for x in h.nul})],
              ["Fox-IT iocitrix findings", "not run" if res["foxit"] is None else len(res["foxit"])],
@@ -1967,6 +2256,13 @@ def write_workbook(res, path, args):
                             "Line"],
                     ([w["time"], w["ip"], w["method"], w["path"], w["status"], w["bytes"], w["ua"], w["file"], w["line"]]
                      for w in res["webshell"]), [20, 16, 8, 50, 8, 10, 50, 30, 8])
+        elif key == "B2":
+            b.table(sheet, ["Time (UTC)", "Client IP", "Method", "Path", "Status", "Payload marker", "Base64 length",
+                            "Decodes to", "SHA-256 of the base64", "SHA-256 decoded", "Matches published hash",
+                            "URLs inside", "IPs inside", "User agent (as logged)", "File (/var/log)", "Line"],
+                    ([w["time"], w["ip"], w["method"], w["path"], w["status"], w["marker"], w["length"], w["kind"],
+                      w["sha_b64"], w["sha_dec"], w["known"], w["urls"], w["ips"], w["ua"], w["file"], w["line"]]
+                     for w in res["ua_payloads"]), [20, 16, 8, 40, 8, 22, 10, 18, 66, 66, 30, 50, 24, 80, 30, 8])
         elif key == "H":
             b.table(sheet, ["IP", "Level", "Known for", "Time (UTC)", "File (/var/log or image path)", "Line", "Text"],
                     ([r[3], *h.ip_info(r[3]), r[2], r[0], r[1], r[4]] for r in rows), [16, 10, 44, 20, 34, 8, 150])
@@ -1985,10 +2281,11 @@ def write_workbook(res, path, args):
                                "Status codes"],
             ([w["ip"], w["path"], w["count"], w["with_body"], w["first"], w["last"], w["days"], w["status"]]
              for w in res["webshell_by_ip"]), [16, 50, 10, 12, 20, 20, 30, 30])
-    b.table("NSPPE_Injections", ["Injected text (after NSPPE;)", "Lines", "First (UTC)", "Last (UTC)", "Client IPs",
-                                 "URLs", "IPs in text", "Files (lines)"],
-            ([n["injected"], n["count"], n["first"], n["last"], n["client_ips"], n["urls"], n["ips_in_text"], n["files"]]
-             for n in res["nsppe"]), [80, 8, 20, 20, 24, 50, 20, 60])
+    b.table("Pitboss_Injections", ["Injected command (text after NSPPE, URL-decoded)", "Lines", "Forged records (B)",
+                                   "Call Home lines (A)", "First (UTC)", "Last (UTC)", "Client IPs", "URLs", "IPs in text",
+                                   "Files (lines)"],
+            ([n["injected"], n["count"], n["forged"], n["callhome"], n["first"], n["last"], n["client_ips"], n["urls"],
+              n["ips_in_text"], n["files"]] for n in res["nsppe"]), [80, 8, 10, 10, 20, 20, 24, 50, 20, 60])
     b.table("Network_IOCs", ["Indicator", "Type", "Role", "Seen in", "Count", "First (UTC)", "Last (UTC)", "Detail"],
             ([n["indicator"], n["type"], n["role"], n["where"], n["count"], n["first"], n["last"], n["detail"]]
              for n in res["network"]), [40, 8, 44, 60, 8, 20, 20, 50])
@@ -2151,26 +2448,69 @@ def write_docx(path, run, results):
             found_any = True
             bullet(f"{len(top_present)} of {len(KNOWN_IOC_PATHS)} known IOC paths are present: "
                    + ", ".join(x["path"] for x in top_present) + ". (IOC_Files)")
+        pb, pa, pu = secs.get("B", {}), secs.get("A", {}), secs.get("B2", {})
+        if pb.get("count") or pa.get("count"):
+            found_any = True
+            cmds = [n for n in r["nsppe"] if n["injected"] != NO_COMMAND]
+            text = (f"PITBOSS log poisoning (CVE-2026-88771): {pb.get('count', 0):,} forged pitboss / NSPPE log record(s)"
+                    + (f", {pb['first']} to {pb['last']}" if pb.get("first") else "")
+                    + (f", carrying {len(cmds)} distinct injected command(s)" if cmds
+                       else ", none with a command after NSPPE (probes or tests)"))
+            if pa.get("count"):
+                text += (f"; {pa['count']:,} line(s) in the Call Home crash checker log (callhomedebug.log) carry an "
+                         f"injected command, the step that runs it")
+            else:
+                text += ("; no callhomedebug.log line carries one (that log rotates, so this alone does not show the "
+                         "commands never ran)")
+            ips = sorted({ip for n in r["nsppe"] for ip in n["client_ips"].split(", ") if ip})
+            if ips:
+                text += f"; client IPs: {', '.join(ips[:15])}" + (f" and {len(ips) - 15} more" if len(ips) > 15 else "")
+            bullet(text + ". (B_Pitboss_Log_Poisoning, A_CallHome_Exec, Pitboss_Injections)")
+        if pu.get("count"):
+            found_any = True
+            ups = r["ua_payloads"]
+            ua_ips = collections.Counter(w["ip"] for w in ups if w["ip"])
+            kinds = collections.Counter(w["kind"] for w in ups)
+            inside = sorted({u for w in ups for u in w["urls"].split()} | {i for w in ups for i in w["ips"].split(", ") if i})
+            known = sorted({k for w in ups for k in w["known"].split("; ") if k})
+            bullet(f"{pu['count']:,} web request(s) with a base64 payload in the User-Agent (PITBOSS stage 1: the injected "
+                   f"command fetches it from the access log and runs it), {pu['first']} to {pu['last']}, from "
+                   + ", ".join(f"{ip} ({n})" for ip, n in ua_ips.most_common(10))
+                   + "; they decode to " + ", ".join(f"{k} x{v}" for k, v in kinds.most_common())
+                   + (f"; URLs and IPs inside: {', '.join(inside[:12])}" if inside else "")
+                   + (f"; {', '.join(known)}" if known else "") + ". (B2_Staged_UA_Payloads)")
+        whole = {x["file"]: x for x in r["hooks"] if x["line"] == "" and x["flags"]}   # file-level rows
         by_file = collections.OrderedDict()
         for x in r["hooks"]:
             if x["line"] != "" and x["flags"]:
                 by_file.setdefault(x["file"], []).append(x)
-        for fname, xs in by_file.items():
+        for fname in list(by_file) + [f_ for f_ in whole if f_ not in by_file]:
+            xs = by_file.get(fname, [])
             cmds = [x for x in xs if not x["text"].lstrip().startswith("#")]
             inst = [m.group(0) for x in xs for m in [re.search(r"installed from \S+ on .+$", x["flags"])] if m]
             flags = sorted({f_.strip() for x in cmds for f_ in x["flags"].split(";") if f_.strip()})
-            if not cmds and not inst:
+            w = whole.get(fname)
+            wflags = [f_.strip() for f_ in w["flags"].split(";")] if w else []
+            window = [f_ for f_ in wflags if "review window" in f_]
+            if not cmds and not inst and not w:
                 continue
-            found_any = True
-            text = f"{fname}: " + "; ".join(f"line {x['line']} \"{x['text'].strip()}\"" for x in cmds)
+            if cmds or inst or window:
+                found_any = True
+            parts = []
+            if "empty crontab" in wflags:
+                parts.append("exists but is empty")
+            if window:
+                parts.append(" and ".join(window) + f" (modified {w['mtime']}, created {w['btime'] or 'unknown'})")
+            if cmds:
+                parts.append("; ".join(f"line {x['line']} \"{x['text'].strip()}\"" for x in cmds))
+            text = f"{fname}: " + "; ".join(parts) if parts else fname
             if inst:
                 text += f" (crontab {inst[0]})"
             if flags:
                 text += ". Flags: " + ", ".join(flags)
+            if window and not cmds:
+                text += ". Read the whole file and compare it with a known good copy"
             bullet(text + ". (Hooks)")
-        for x in r["hooks"]:
-            if "empty crontab" in x["flags"] and x["line"] == "":
-                bullet(f"{x['file']} exists but is empty (modified {x['mtime']}, created {x['btime']}). (Hooks)")
         if secs.get("E", {}).get("count"):
             found_any = True
             ips = len({w["ip"] for w in r["webshell_by_ip"]})
@@ -2179,14 +2519,10 @@ def write_docx(path, run, results):
             bullet(f"{secs['E']['count']:,} requests to the webshell paths from {ips} client IP(s), {secs['E']['first']} to "
                    f"{secs['E']['last']} (status codes " + ", ".join(f"{k} x{v:,}" for k, v in st_codes.most_common(4))
                    + f"); {body:,} had a non-empty response body. (E_Webshell_Requests, Webshell_by_IP)")
-        if r["nsppe"]:
-            found_any = True
-            bullet(f"{len(r['nsppe'])} distinct command(s) injected through the NSPPE; log-poisoning pattern; "
-                   f"{secs.get('A', {}).get('count', 0)} execution line(s) in the call-home crash checker log (A) and "
-                   f"{secs.get('B', {}).get('count', 0)} poisoned log entries in messages/ns.log (B). (NSPPE_Injections)")
         if secs.get("D", {}).get("count") or secs.get("C", {}).get("count"):
-            bullet(f"{secs.get('D', {}).get('count', 0)} packet engine (NSPPE) crash line(s) and "
-                   f"{secs.get('C', {}).get('count', 0)} nsaaad crash or pitboss reboot line(s). (C, D)")
+            bullet(f"{secs.get('D', {}).get('count', 0)} genuine packet engine (NSPPE) crash record(s) from pitboss and "
+                   f"{secs.get('C', {}).get('count', 0)} nsaaad crash, restart-limit or pitboss reboot line(s); forged "
+                   f"pitboss records are not counted here. (C, D)")
         if secs.get("F", {}).get("count"):
             found_any = True
             bullet(f"{secs['F']['count']} .relay installer line(s) in the shell audit log, {secs['F']['first']} to "
@@ -2217,9 +2553,15 @@ def write_docx(path, run, results):
                    + (": " + ", ".join(f"{k} {v}" for k, v in types.most_common()) if types else "")
                    + ". file/timestomp hits are often caused by upgrades. (FoxIT_iocitrix)")
         leads = [d for d in r["discovery"] if d["category"].startswith("Lead")]
+        pkg = [d for d in leads if "client download folder" in d["category"]]
+        if pkg:
+            found_any = True
+            bullet("VPN / EPA client download folder: " + "; ".join(f"{d['path']} ({d['category'].split(': ', 2)[-1]})"
+                                                                  for d in pkg[:10])
+                   + ". Unit 42 reported the actor hosting webshells there under package names. (Discovery)")
         if leads:
-            bullet(f"{len(leads)} item(s) on disk to review (hidden, new in /flash, /var/tmp or /var/nstmp, or written by "
-                   f"the web server in the window). (Discovery)")
+            bullet(f"{len(leads)} item(s) on disk to review (hidden, new in /flash, /var/tmp or /var/nstmp, written by the "
+                   f"web server in the window, or a suspect file in the VPN / EPA client download folders). (Discovery)")
         if not found_any:
             bullet("None of the known implant paths, hooks or log indicators were found in this image.")
 
@@ -2230,9 +2572,18 @@ def write_docx(path, run, results):
                     r["base_presence"].get(x["path"], "")] for x in present),
                   [2.6, 0.45, 0.55, 1.15, 1.15, 3.3, 0.6], mono=(5,))
         if r["hooks"]:
-            doc.add_heading("Boot script and crontab lines", 2)
-            table(["File", "Line", "Text", "Flags"],
-                  ([x["file"], x["line"], x["text"], x["flags"]] for x in r["hooks"]), [2.2, 0.4, 3.6, 3.6])
+            flagged_h = [x for x in r["hooks"] if x["flags"]]
+            quiet = [x for x in r["hooks"] if not x["flags"] and x["line"] != ""]
+            quiet_files = sorted({x["file"] for x in quiet})
+            doc.add_heading("Boot script and crontab lines with flags", 2)
+            if quiet:
+                para(f"{len(quiet)} other line(s) in {', '.join(quiet_files)} have no flags and are not findings (these "
+                     f"files hold ordinary settings on most appliances); all lines are on the Hooks sheet.", italic=True)
+            if flagged_h:
+                table(["File", "Line", "Text", "Flags"],
+                      ([x["file"], x["line"], x["text"], x["flags"]] for x in flagged_h), [2.2, 0.4, 3.6, 3.6])
+            else:
+                para("No boot script or crontab line was flagged.")
         doc.add_heading("Log hunts", 2)
         table(["Section", "What it looks for", "Hits", "First (UTC)", "Last (UTC)", "Files (hits)"],
               ([s["key"], s["title"], f"{s['count']:,}", s["first"], s["last"], s["files"][:600]] for s in r["sections"]),
@@ -2250,10 +2601,21 @@ def write_docx(path, run, results):
                   ([w["ip"], w["path"], f"{w['count']:,}", w["with_body"], w["first"], w["last"], w["status"]]
                    for w in r["webshell_by_ip"][:25]), [1.2, 2.8, 0.7, 0.7, 1.3, 1.3, 1.6])
         if r["nsppe"]:
-            doc.add_heading("Commands injected through NSPPE; log poisoning", 2)
-            table(["Injected text", "Lines", "First (UTC)", "Last (UTC)", "Client IPs"],
-                  ([n["injected"], n["count"], n["first"], n["last"], n["client_ips"]] for n in r["nsppe"]),
-                  [5.0, 0.5, 1.3, 1.3, 1.6])
+            doc.add_heading("PITBOSS log poisoning: injected commands (CVE-2026-88771)", 2)
+            para("Each forged record is a login whose user name imitates a pitboss crash record; the Call Home crash "
+                 "checker runs the text after NSPPE on an unpatched appliance. Forged = log records (B); Call Home = "
+                 "callhomedebug.log lines (A). The full lines are on the B and A sheets.", italic=True)
+            table(["Injected command", "Forged", "Call Home", "First (UTC)", "Last (UTC)", "Client IPs"],
+                  ([n["injected"], n["forged"], n["callhome"], n["first"], n["last"], n["client_ips"]]
+                   for n in r["nsppe"][:60]), [4.6, 0.55, 0.65, 1.3, 1.3, 1.4])
+        if r["ua_payloads"]:
+            doc.add_heading("PITBOSS stage 1: base64 payloads staged in the User-Agent", 2)
+            para("The payload content is not reproduced here; the B2 sheet has its SHA-256, what it decodes to and the "
+                 "URLs and IPs inside it. Decode the User-Agent from the log line to read it.", italic=True)
+            table(["Time (UTC)", "Client IP", "Path", "Status", "Decodes to", "URLs and IPs inside"],
+                  ([w["time"], w["ip"], w["path"], w["status"], w["kind"],
+                    " ".join(x for x in (w["urls"], w["ips"]) if x)] for w in r["ua_payloads"][:40]),
+                  [1.3, 1.2, 2.4, 0.6, 1.2, 3.1])
         if r["network"]:
             doc.add_heading("Network indicators", 2)
             table(["Indicator", "Role", "Count", "First (UTC)", "Last (UTC)", "Detail"],
